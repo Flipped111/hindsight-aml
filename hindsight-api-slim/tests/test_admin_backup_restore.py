@@ -1,0 +1,810 @@
+"""
+Tests for admin backup and restore functionality.
+
+These tests use an isolated schema to avoid interfering with other tests.
+The backup/restore operations truncate tables, which would cause deadlocks
+and race conditions if run against the shared public schema.
+"""
+
+import tempfile
+import uuid
+import zipfile
+from pathlib import Path
+from unittest.mock import AsyncMock
+
+import asyncpg
+import pytest
+import pytest_asyncio
+
+import hindsight_api.admin.cli as admin_cli
+from hindsight_api.admin.cli import BACKUP_TABLES, _backup, _restore
+from hindsight_api.extensions import Tenant
+from hindsight_api.migrations import run_migrations
+
+# Run these tests sequentially since they do full DB backup/restore
+pytestmark = pytest.mark.xdist_group(name="backup_restore")
+
+
+@pytest_asyncio.fixture(scope="function")
+async def backup_test_schema(pg0_db_url, embeddings):
+    """Create an isolated schema for backup/restore tests.
+
+    Uses a unique schema name per test invocation to avoid conflicts with
+    parallel test runs or leftover state from interrupted runs.
+
+    Returns a tuple of (db_url, schema_name, fq_helper, embeddings).
+    """
+    # Initialize embeddings if not already done
+    await embeddings.initialize()
+
+    # Use unique schema name to avoid conflicts
+    schema_name = f"backup_test_{uuid.uuid4().hex[:8]}"
+
+    def _fq(table: str) -> str:
+        """Get fully-qualified table name in test schema."""
+        return f"{schema_name}.{table}"
+
+    conn = await asyncpg.connect(pg0_db_url)
+    try:
+        await conn.execute(f"CREATE SCHEMA {schema_name}")
+    finally:
+        await conn.close()
+
+    # Run migrations on the isolated schema
+    run_migrations(pg0_db_url, schema=schema_name)
+
+    yield pg0_db_url, schema_name, _fq, embeddings
+
+    # Cleanup after test
+    conn = await asyncpg.connect(pg0_db_url)
+    try:
+        await conn.execute(f"DROP SCHEMA IF EXISTS {schema_name} CASCADE")
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_backup_tables_covers_entire_schema(backup_test_schema):
+    """BACKUP_TABLES must list every persistent table in the live PG schema.
+
+    A missing entry silently drops that table's data on restore — and because
+    restore runs `TRUNCATE banks CASCADE`, any FK-to-banks child (mental_models,
+    directives, async_operations, webhooks) gets wiped even though it was never
+    backed up. This guard fails whenever a migration adds a table without adding
+    it to BACKUP_TABLES, forcing a conscious decision instead of silent dataloss.
+    """
+    db_url, schema_name, _fq, _embeddings = backup_test_schema
+
+    conn = await asyncpg.connect(db_url)
+    try:
+        rows = await conn.fetch(
+            """
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = $1 AND table_type = 'BASE TABLE'
+            """,
+            schema_name,
+        )
+    finally:
+        await conn.close()
+
+    # alembic_version is migration bookkeeping, not data — never backed up.
+    # bank_stats_cache is a derived TTL cache of get_bank_stats results: it has no
+    # FK to banks (so the restore cascade never touches it) and repopulates itself
+    # on demand, so it is deliberately not backed up — a restore starts it cold.
+    schema_tables = {r["table_name"] for r in rows} - {"alembic_version", "bank_stats_cache"}
+    backup_tables = set(BACKUP_TABLES)
+
+    missing = schema_tables - backup_tables
+    stale = backup_tables - schema_tables
+    assert not missing, (
+        f"Tables exist in the schema but are missing from BACKUP_TABLES "
+        f"(their data would be lost on restore): {sorted(missing)}"
+    )
+    assert not stale, f"BACKUP_TABLES lists tables that no longer exist in the schema: {sorted(stale)}"
+    # No duplicates — a repeated entry would COPY/TRUNCATE the same table twice.
+    assert len(BACKUP_TABLES) == len(set(BACKUP_TABLES)), "BACKUP_TABLES has duplicate entries"
+
+
+@pytest.mark.asyncio
+async def test_backup_restore_roundtrip(backup_test_schema):
+    """Test that backup and restore preserves all data correctly."""
+    db_url, schema_name, _fq, embeddings = backup_test_schema
+    bank_id = f"test-backup-{uuid.uuid4().hex[:8]}"
+    conn = await asyncpg.connect(db_url)
+
+    try:
+        # Create a bank
+        await conn.execute(
+            f"INSERT INTO {_fq('banks')} (bank_id) VALUES ($1) ON CONFLICT DO NOTHING",
+            bank_id,
+        )
+
+        # Create some test memory units with embeddings
+        # Convert embedding list to pgvector format string
+        embedding_list = embeddings.encode(["Test content about Alice"])[0]
+        embedding_str = "[" + ",".join(str(x) for x in embedding_list) + "]"
+        for text in [
+            "Alice is a software engineer who loves Python.",
+            "Bob works with Alice on the backend team.",
+            "The team uses PostgreSQL for their database.",
+        ]:
+            await conn.execute(
+                f"""INSERT INTO {_fq("memory_units")}
+                    (bank_id, text, fact_type, embedding, event_date)
+                    VALUES ($1, $2, 'world', $3::vector, NOW())""",
+                bank_id,
+                text,
+                embedding_str,
+            )
+
+        # Insert a directive (FK -> banks). Restore TRUNCATEs banks CASCADE,
+        # which wipes FK-to-banks children, so a directive that survives the
+        # roundtrip proves those tables are actually backed up and restored.
+        await conn.execute(
+            f"""INSERT INTO {_fq("directives")} (bank_id, name, content)
+                VALUES ($1, $2, $3)""",
+            bank_id,
+            "tone",
+            "Always answer concisely.",
+        )
+
+        # Get counts before backup
+        counts_before = {}
+        for table in BACKUP_TABLES:
+            counts_before[table] = await conn.fetchval(f"SELECT COUNT(*) FROM {_fq(table)}")
+
+        # Verify we have data
+        assert counts_before["banks"] > 0
+        assert counts_before["memory_units"] > 0
+        assert counts_before["directives"] > 0
+
+    finally:
+        await conn.close()
+
+    # Backup to a temp file
+    with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as f:
+        backup_path = Path(f.name)
+
+    try:
+        manifest = await _backup(db_url, backup_path, schema=schema_name)
+
+        # Verify backup file exists and is valid
+        assert backup_path.exists()
+        assert backup_path.stat().st_size > 0
+
+        # Verify manifest
+        assert manifest["version"] == "2"
+        assert "created_at" in manifest
+        for table in BACKUP_TABLES:
+            assert table in manifest["tables"]
+            assert manifest["tables"][table]["rows"] == counts_before[table]
+            assert manifest["tables"][table]["columns"]
+
+        # Verify zip contents
+        with zipfile.ZipFile(backup_path, "r") as zf:
+            assert "manifest.json" in zf.namelist()
+            for table in BACKUP_TABLES:
+                assert f"{table}.bin" in zf.namelist()
+
+        # Clear all data
+        conn = await asyncpg.connect(db_url)
+        try:
+            for table in reversed(BACKUP_TABLES):
+                await conn.execute(f"TRUNCATE TABLE {_fq(table)} CASCADE")
+
+            # Verify data is gone
+            for table in BACKUP_TABLES:
+                count = await conn.fetchval(f"SELECT COUNT(*) FROM {_fq(table)}")
+                assert count == 0, f"Table {table} should be empty after truncate"
+        finally:
+            await conn.close()
+
+        # Restore from backup
+        await _restore(db_url, backup_path, schema=schema_name)
+
+        # Verify counts match original
+        conn = await asyncpg.connect(db_url)
+        try:
+            for table in BACKUP_TABLES:
+                count = await conn.fetchval(f"SELECT COUNT(*) FROM {_fq(table)}")
+                assert count == counts_before[table], f"Table {table} count mismatch after restore"
+
+            # Verify data content is preserved
+            texts = await conn.fetch(
+                f"SELECT text FROM {_fq('memory_units')} WHERE bank_id = $1",
+                bank_id,
+            )
+            text_content = " ".join(r["text"] for r in texts)
+            assert "Alice" in text_content or "software" in text_content
+
+            directive_content = await conn.fetchval(
+                f"SELECT content FROM {_fq('directives')} WHERE bank_id = $1",
+                bank_id,
+            )
+            assert directive_content == "Always answer concisely."
+        finally:
+            await conn.close()
+
+    finally:
+        # Cleanup
+        if backup_path.exists():
+            backup_path.unlink()
+
+
+@pytest.mark.asyncio
+async def test_backup_restore_preserves_all_column_types(backup_test_schema):
+    """Test that all column types are preserved: vectors, UUIDs, timestamps, JSONB."""
+    db_url, schema_name, _fq, embeddings = backup_test_schema
+    bank_id = f"test-types-{uuid.uuid4().hex[:8]}"
+    conn = await asyncpg.connect(db_url)
+
+    try:
+        # Create a bank
+        await conn.execute(
+            f"INSERT INTO {_fq('banks')} (bank_id) VALUES ($1) ON CONFLICT DO NOTHING",
+            bank_id,
+        )
+
+        # Create a memory unit with all column types
+        # Convert embedding list to pgvector format string
+        embedding_list = embeddings.encode(["John Smith engineer"])[0]
+        embedding_str = "[" + ",".join(str(x) for x in embedding_list) + "]"
+        await conn.execute(
+            f"""INSERT INTO {_fq("memory_units")}
+                (bank_id, text, fact_type, embedding, event_date, metadata)
+                VALUES ($1, $2, 'world', $3::vector, NOW(), $4)""",
+            bank_id,
+            "John Smith is a senior engineer at Acme Corp since 2020.",
+            embedding_str,
+            '{"key": "value"}',
+        )
+
+        # Create an entity
+        await conn.execute(
+            f"""INSERT INTO {_fq("entities")}
+                (bank_id, canonical_name, metadata)
+                VALUES ($1, $2, $3)""",
+            bank_id,
+            "John Smith",
+            '{"role": "engineer"}',
+        )
+
+        # Get original data
+        original_unit = await conn.fetchrow(
+            f"""SELECT id, embedding, event_date, created_at, metadata, text
+               FROM {_fq("memory_units")} WHERE bank_id = $1 LIMIT 1""",
+            bank_id,
+        )
+        original_entity = await conn.fetchrow(
+            f"""SELECT id, first_seen, last_seen, metadata, canonical_name
+               FROM {_fq("entities")} WHERE bank_id = $1 LIMIT 1""",
+            bank_id,
+        )
+        original_bank = await conn.fetchrow(
+            f"SELECT bank_id, created_at, updated_at FROM {_fq('banks')} WHERE bank_id = $1",
+            bank_id,
+        )
+    finally:
+        await conn.close()
+
+    assert original_unit is not None, "Should have created memory units"
+    assert original_unit["embedding"] is not None, "Should have embedding"
+    assert original_unit["id"] is not None, "Should have UUID"
+    assert original_entity is not None, "Should have created entities"
+
+    with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as f:
+        backup_path = Path(f.name)
+
+    try:
+        await _backup(db_url, backup_path, schema=schema_name)
+
+        # Clear all data
+        conn = await asyncpg.connect(db_url)
+        try:
+            for table in reversed(BACKUP_TABLES):
+                await conn.execute(f"TRUNCATE TABLE {_fq(table)} CASCADE")
+        finally:
+            await conn.close()
+
+        await _restore(db_url, backup_path, schema=schema_name)
+
+        # Verify all column types are preserved exactly
+        conn = await asyncpg.connect(db_url)
+        try:
+            restored_unit = await conn.fetchrow(
+                f"""SELECT id, embedding, event_date, created_at, metadata, text
+                   FROM {_fq("memory_units")} WHERE bank_id = $1 LIMIT 1""",
+                bank_id,
+            )
+            restored_entity = await conn.fetchrow(
+                f"""SELECT id, first_seen, last_seen, metadata, canonical_name
+                   FROM {_fq("entities")} WHERE bank_id = $1 LIMIT 1""",
+                bank_id,
+            )
+            restored_bank = await conn.fetchrow(
+                f"SELECT bank_id, created_at, updated_at FROM {_fq('banks')} WHERE bank_id = $1",
+                bank_id,
+            )
+        finally:
+            await conn.close()
+
+        # Verify memory_units
+        assert restored_unit is not None, "Should have restored memory unit"
+        assert restored_unit["id"] == original_unit["id"], "UUID should match exactly"
+        assert restored_unit["text"] == original_unit["text"], "Text should match"
+        assert list(restored_unit["embedding"]) == list(original_unit["embedding"]), (
+            "Vector embedding should match exactly"
+        )
+        assert restored_unit["event_date"] == original_unit["event_date"], "Timestamp should match exactly"
+        assert restored_unit["created_at"] == original_unit["created_at"], "Created timestamp should match"
+        assert restored_unit["metadata"] == original_unit["metadata"], "JSONB metadata should match"
+
+        # Verify entities
+        assert restored_entity is not None, "Should have restored entity"
+        assert restored_entity["id"] == original_entity["id"], "Entity UUID should match"
+        assert restored_entity["canonical_name"] == original_entity["canonical_name"], "Entity name should match"
+        assert restored_entity["first_seen"] == original_entity["first_seen"], "Entity first_seen should match"
+        assert restored_entity["last_seen"] == original_entity["last_seen"], "Entity last_seen should match"
+        assert restored_entity["metadata"] == original_entity["metadata"], "Entity metadata should match"
+
+        # Verify banks
+        assert restored_bank is not None, "Should have restored bank"
+        assert restored_bank["bank_id"] == original_bank["bank_id"], "Bank ID should match"
+        assert restored_bank["created_at"] == original_bank["created_at"], "Bank created_at should match"
+
+    finally:
+        if backup_path.exists():
+            backup_path.unlink()
+
+
+@pytest.mark.asyncio
+async def test_restore_ignores_backup_columns_the_target_dropped(backup_test_schema):
+    """A column dropped by a migration must not make older backups unrestorable.
+
+    Restore used to reject the backup outright ("target is missing backup
+    columns …"). It now strips those fields from the binary COPY stream instead.
+    Two legacy columns are backed up and only the *first* is dropped, so a stream
+    rewrite that got the positions wrong would shift the survivor's value (or the
+    trailing real columns) and fail the assertions below rather than silently
+    landing data in the wrong column.
+    """
+    db_url, schema_name, _fq, _embeddings = backup_test_schema
+    bank_id = f"drop-col-{uuid.uuid4().hex[:8]}"
+    doc_id = f"doc-{uuid.uuid4().hex[:8]}"
+    conn = await asyncpg.connect(db_url)
+    try:
+        await conn.execute(f"ALTER TABLE {_fq('documents')} ADD COLUMN legacy_dropped TEXT")
+        await conn.execute(f"ALTER TABLE {_fq('documents')} ADD COLUMN legacy_kept TEXT")
+        await conn.execute(f"INSERT INTO {_fq('banks')} (bank_id) VALUES ($1)", bank_id)
+        await conn.execute(
+            f"""INSERT INTO {_fq("documents")} (id, bank_id, original_text, legacy_dropped, legacy_kept)
+                VALUES ($1, $2, $3, $4, $5)""",
+            doc_id,
+            bank_id,
+            "the surviving document body",
+            "value that goes away",
+            "value that must survive",
+        )
+        # A NULL in a dropped-adjacent column exercises the -1 field-length path
+        # of the stream rewrite.
+        await conn.execute(
+            f"""INSERT INTO {_fq("documents")} (id, bank_id, original_text, legacy_dropped, legacy_kept)
+                VALUES ($1, $2, $3, NULL, NULL)""",
+            f"{doc_id}-null",
+            bank_id,
+            "second document",
+        )
+    finally:
+        await conn.close()
+
+    with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as f:
+        backup_path = Path(f.name)
+
+    try:
+        await _backup(db_url, backup_path, schema=schema_name)
+        conn = await asyncpg.connect(db_url)
+        try:
+            await conn.execute(f"ALTER TABLE {_fq('documents')} DROP COLUMN legacy_dropped")
+        finally:
+            await conn.close()
+
+        await _restore(db_url, backup_path, schema=schema_name)
+
+        conn = await asyncpg.connect(db_url)
+        try:
+            rows = await conn.fetch(
+                f"SELECT id, bank_id, original_text, legacy_kept FROM {_fq('documents')} ORDER BY id",
+            )
+        finally:
+            await conn.close()
+
+        assert [row["id"] for row in rows] == [doc_id, f"{doc_id}-null"]
+        assert rows[0]["bank_id"] == bank_id
+        assert rows[0]["original_text"] == "the surviving document body"
+        assert rows[0]["legacy_kept"] == "value that must survive"
+        assert rows[1]["original_text"] == "second document"
+        assert rows[1]["legacy_kept"] is None
+    finally:
+        if backup_path.exists():
+            backup_path.unlink()
+
+
+@pytest.mark.asyncio
+async def test_restore_rejects_incompatible_column_type_before_truncating(backup_test_schema):
+    """A column present in both schemas but with a different type must fail preflight."""
+    db_url, schema_name, _fq, _embeddings = backup_test_schema
+    conn = await asyncpg.connect(db_url)
+    try:
+        await conn.execute(f"ALTER TABLE {_fq('documents')} ADD COLUMN drift_col INTEGER")
+        await conn.execute(f"INSERT INTO {_fq('banks')} (bank_id) VALUES ('source-bank')")
+    finally:
+        await conn.close()
+
+    with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as f:
+        backup_path = Path(f.name)
+
+    try:
+        await _backup(db_url, backup_path, schema=schema_name)
+        conn = await asyncpg.connect(db_url)
+        try:
+            # Same column name, incompatible type in the target.
+            await conn.execute(f"ALTER TABLE {_fq('documents')} DROP COLUMN drift_col")
+            await conn.execute(f"ALTER TABLE {_fq('documents')} ADD COLUMN drift_col TEXT")
+            await conn.execute(f"INSERT INTO {_fq('banks')} (bank_id) VALUES ('target-bank')")
+        finally:
+            await conn.close()
+
+        with pytest.raises(ValueError, match=r"documents: incompatible column types: drift_col"):
+            await _restore(db_url, backup_path, schema=schema_name)
+
+        conn = await asyncpg.connect(db_url)
+        try:
+            banks = await conn.fetch(f"SELECT bank_id FROM {_fq('banks')} ORDER BY bank_id")
+        finally:
+            await conn.close()
+        assert [row["bank_id"] for row in banks] == ["source-bank", "target-bank"]
+    finally:
+        if backup_path.exists():
+            backup_path.unlink()
+
+
+@pytest.mark.asyncio
+async def test_restore_succeeds_when_target_has_additional_nullable_column(backup_test_schema):
+    """A target with an extra nullable column not in the backup restores cleanly.
+
+    Binary COPY without an explicit column list would fail this with a field-count
+    error; pinning the source column list is what lets these restores succeed.
+    """
+    db_url, schema_name, _fq, _embeddings = backup_test_schema
+    conn = await asyncpg.connect(db_url)
+    try:
+        await conn.execute(f"INSERT INTO {_fq('banks')} (bank_id) VALUES ('roundtrip-bank')")
+    finally:
+        await conn.close()
+
+    with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as f:
+        backup_path = Path(f.name)
+
+    try:
+        await _backup(db_url, backup_path, schema=schema_name)
+        conn = await asyncpg.connect(db_url)
+        try:
+            await conn.execute(f"ALTER TABLE {_fq('banks')} ADD COLUMN target_only_note TEXT")
+        finally:
+            await conn.close()
+
+        # The extra target column is not in the backup, so validation passes and
+        # restore copies only the source columns; the new column stays NULL.
+        await _restore(db_url, backup_path, schema=schema_name)
+
+        conn = await asyncpg.connect(db_url)
+        try:
+            rows = await conn.fetch(f"SELECT bank_id, target_only_note FROM {_fq('banks')} ORDER BY bank_id")
+        finally:
+            await conn.close()
+        assert [row["bank_id"] for row in rows] == ["roundtrip-bank"]
+        assert rows[0]["target_only_note"] is None
+    finally:
+        if backup_path.exists():
+            backup_path.unlink()
+
+
+@pytest.mark.asyncio
+async def test_backup_restore_includes_extension_table(backup_test_schema):
+    """An extension-declared bank-scoped table rides along backup + restore.
+
+    Simulates a table an extension provisions in the tenant schema (core knows
+    nothing about it). Passing the augmented ``backup_tables`` list — as
+    ``_effective_backup_tables()`` builds from ``TenantExtension.extra_bank_tables``
+    — must back it up AND restore it, so restore's ``TRUNCATE ... CASCADE`` can't
+    silently drop it.
+    """
+    db_url, schema_name, _fq, _embeddings = backup_test_schema
+    extra = "ext_audit_receipts"
+    effective = [*BACKUP_TABLES, extra]
+
+    conn = await asyncpg.connect(db_url)
+    try:
+        await conn.execute(f"CREATE TABLE {_fq(extra)} (id uuid PRIMARY KEY, bank_id text NOT NULL, payload text)")
+        kept_id = uuid.uuid4()
+        await conn.execute(
+            f"INSERT INTO {_fq(extra)} (id, bank_id, payload) VALUES ($1, $2, $3)",
+            kept_id,
+            "bank-x",
+            "original receipt",
+        )
+    finally:
+        await conn.close()
+
+    with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as f:
+        backup_path = Path(f.name)
+
+    try:
+        manifest = await _backup(db_url, backup_path, schema=schema_name, backup_tables=effective)
+        assert manifest["tables"][extra]["rows"] == 1
+
+        # Mutate after backup: a row that must NOT survive restore.
+        conn = await asyncpg.connect(db_url)
+        try:
+            await conn.execute(
+                f"INSERT INTO {_fq(extra)} (id, bank_id, payload) VALUES ($1, $2, $3)",
+                uuid.uuid4(),
+                "bank-x",
+                "post-backup row",
+            )
+        finally:
+            await conn.close()
+
+        await _restore(db_url, backup_path, schema=schema_name, backup_tables=effective)
+
+        conn = await asyncpg.connect(db_url)
+        try:
+            rows = await conn.fetch(f"SELECT id, payload FROM {_fq(extra)}")
+        finally:
+            await conn.close()
+
+        # Restore reset the table to exactly its backed-up contents.
+        assert len(rows) == 1
+        assert rows[0]["id"] == kept_id
+        assert rows[0]["payload"] == "original receipt"
+    finally:
+        if backup_path.exists():
+            backup_path.unlink()
+
+
+@pytest.mark.asyncio
+async def test_run_migration_without_schema_discovers_and_deduplicates_schemas(monkeypatch):
+    """run-db-migration without --schema should include the base schema and deduplicate tenant schemas."""
+    calls: dict[str, list] = {
+        "run_migrations": [],
+        "ensure_vector_extension": [],
+        "ensure_text_search_extension": [],
+    }
+
+    class MockTenantExtension:
+        async def list_tenants(self):
+            return [
+                Tenant(schema="public"),
+                Tenant(schema="tenant_demo"),
+                Tenant(schema="tenant_demo"),
+            ]
+
+    async def fake_resolve_database_url(db_url: str) -> str:
+        return f"resolved::{db_url}"
+
+    def fake_run_migrations(database_url: str, schema: str | None = None, **kwargs) -> None:
+        calls["run_migrations"].append((database_url, schema))
+
+    def fake_ensure_vector_extension(
+        database_url: str,
+        vector_extension: str = "pgvector",
+        schema: str | None = None,
+    ) -> None:
+        calls["ensure_vector_extension"].append((database_url, vector_extension, schema))
+
+    def fake_ensure_text_search_extension(
+        database_url: str,
+        text_search_extension: str = "native",
+        schema: str | None = None,
+        pg_search_tokenizer: str | None = None,
+    ) -> None:
+        calls["ensure_text_search_extension"].append((database_url, text_search_extension, pg_search_tokenizer, schema))
+
+    monkeypatch.setenv("HINDSIGHT_API_DATABASE_URL", "postgresql://test")
+    monkeypatch.setattr(admin_cli, "load_extension", lambda *args, **kwargs: MockTenantExtension())
+    monkeypatch.setattr(admin_cli, "resolve_database_url", fake_resolve_database_url)
+    # Extension-table provisioning does a real connect; these tests mock the DB, so stub it.
+    monkeypatch.setattr(admin_cli, "_provision_extra_bank_tables", AsyncMock())
+
+    from hindsight_api import migrations as migrations_module
+
+    monkeypatch.setattr(migrations_module, "run_migrations", fake_run_migrations)
+    monkeypatch.setattr(migrations_module, "ensure_vector_extension", fake_ensure_vector_extension)
+    monkeypatch.setattr(migrations_module, "ensure_text_search_extension", fake_ensure_text_search_extension)
+
+    schemas = await admin_cli._run_migration("postgresql://test")
+
+    assert schemas == ["public", "tenant_demo"]
+    assert calls["run_migrations"] == [
+        ("resolved::postgresql://test", "public"),
+        ("resolved::postgresql://test", "tenant_demo"),
+    ]
+    assert calls["ensure_vector_extension"] == [
+        ("resolved::postgresql://test", "pgvector", "public"),
+        ("resolved::postgresql://test", "pgvector", "tenant_demo"),
+    ]
+    assert calls["ensure_text_search_extension"] == [
+        ("resolved::postgresql://test", "native", "", "public"),
+        ("resolved::postgresql://test", "native", "", "tenant_demo"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_run_migration_without_schema_runs_optional_post_migration_hooks(monkeypatch):
+    """Embedding dimension sync should be optional, while vector/text checks always run."""
+    monkeypatch.setenv("HINDSIGHT_API_DATABASE_URL", "postgresql://test")
+    calls: dict[str, list] = {
+        "run_migrations": [],
+        "ensure_embedding_dimension": [],
+        "ensure_vector_extension": [],
+        "ensure_text_search_extension": [],
+    }
+
+    class MockTenantExtension:
+        async def list_tenants(self):
+            return [Tenant(schema="tenant_demo")]
+
+    async def fake_resolve_database_url(db_url: str) -> str:
+        return f"resolved::{db_url}"
+
+    def fake_run_migrations(database_url: str, schema: str | None = None, **kwargs) -> None:
+        calls["run_migrations"].append((database_url, schema))
+
+    def fake_ensure_embedding_dimension(
+        database_url: str,
+        dimension: int,
+        schema: str | None = None,
+        vector_extension: str = "pgvector",
+    ) -> None:
+        calls["ensure_embedding_dimension"].append((database_url, dimension, schema, vector_extension))
+
+    def fake_ensure_vector_extension(
+        database_url: str,
+        vector_extension: str = "pgvector",
+        schema: str | None = None,
+    ) -> None:
+        calls["ensure_vector_extension"].append((database_url, vector_extension, schema))
+
+    def fake_ensure_text_search_extension(
+        database_url: str,
+        text_search_extension: str = "native",
+        schema: str | None = None,
+        pg_search_tokenizer: str | None = None,
+    ) -> None:
+        calls["ensure_text_search_extension"].append((database_url, text_search_extension, pg_search_tokenizer, schema))
+
+    monkeypatch.setattr(admin_cli, "load_extension", lambda *args, **kwargs: MockTenantExtension())
+    monkeypatch.setattr(admin_cli, "resolve_database_url", fake_resolve_database_url)
+    # Extension-table provisioning does a real connect; these tests mock the DB, so stub it.
+    monkeypatch.setattr(admin_cli, "_provision_extra_bank_tables", AsyncMock())
+
+    from hindsight_api import migrations as migrations_module
+
+    monkeypatch.setattr(migrations_module, "run_migrations", fake_run_migrations)
+    monkeypatch.setattr(migrations_module, "ensure_embedding_dimension", fake_ensure_embedding_dimension)
+    monkeypatch.setattr(migrations_module, "ensure_vector_extension", fake_ensure_vector_extension)
+    monkeypatch.setattr(migrations_module, "ensure_text_search_extension", fake_ensure_text_search_extension)
+
+    schemas = await admin_cli._run_migration(
+        "postgresql://test",
+        base_schema="public",
+        embedding_dimension=384,
+    )
+
+    assert schemas == ["public", "tenant_demo"]
+    assert calls["run_migrations"] == [
+        ("resolved::postgresql://test", "public"),
+        ("resolved::postgresql://test", "tenant_demo"),
+    ]
+    assert calls["ensure_embedding_dimension"] == [
+        ("resolved::postgresql://test", 384, "public", "pgvector"),
+        ("resolved::postgresql://test", 384, "tenant_demo", "pgvector"),
+    ]
+    assert calls["ensure_vector_extension"] == [
+        ("resolved::postgresql://test", "pgvector", "public"),
+        ("resolved::postgresql://test", "pgvector", "tenant_demo"),
+    ]
+    assert calls["ensure_text_search_extension"] == [
+        ("resolved::postgresql://test", "native", "", "public"),
+        ("resolved::postgresql://test", "native", "", "tenant_demo"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_run_migration_with_schema_only_runs_requested_schema(monkeypatch):
+    """run-db-migration with --schema should only migrate the requested schema."""
+    monkeypatch.setenv("HINDSIGHT_API_DATABASE_URL", "postgresql://test")
+    calls: dict[str, list] = {
+        "run_migrations": [],
+        "ensure_vector_extension": [],
+        "ensure_text_search_extension": [],
+    }
+
+    class MockTenantExtension:
+        async def list_tenants(self):
+            return [Tenant(schema="tenant_demo"), Tenant(schema="tenant_other")]
+
+    async def fake_resolve_database_url(db_url: str) -> str:
+        return f"resolved::{db_url}"
+
+    def fake_run_migrations(database_url: str, schema: str | None = None, **kwargs) -> None:
+        calls["run_migrations"].append((database_url, schema))
+
+    def fake_ensure_vector_extension(
+        database_url: str,
+        vector_extension: str = "pgvector",
+        schema: str | None = None,
+    ) -> None:
+        calls["ensure_vector_extension"].append((database_url, vector_extension, schema))
+
+    def fake_ensure_text_search_extension(
+        database_url: str,
+        text_search_extension: str = "native",
+        schema: str | None = None,
+        pg_search_tokenizer: str | None = None,
+    ) -> None:
+        calls["ensure_text_search_extension"].append((database_url, text_search_extension, pg_search_tokenizer, schema))
+
+    monkeypatch.setattr(admin_cli, "load_extension", lambda *args, **kwargs: MockTenantExtension())
+    monkeypatch.setattr(admin_cli, "resolve_database_url", fake_resolve_database_url)
+    # Extension-table provisioning does a real connect; these tests mock the DB, so stub it.
+    monkeypatch.setattr(admin_cli, "_provision_extra_bank_tables", AsyncMock())
+
+    from hindsight_api import migrations as migrations_module
+
+    monkeypatch.setattr(migrations_module, "run_migrations", fake_run_migrations)
+    monkeypatch.setattr(migrations_module, "ensure_vector_extension", fake_ensure_vector_extension)
+    monkeypatch.setattr(migrations_module, "ensure_text_search_extension", fake_ensure_text_search_extension)
+
+    schemas = await admin_cli._run_migration("postgresql://test", schema="tenant_demo")
+
+    assert schemas == ["tenant_demo"]
+    assert calls["run_migrations"] == [("resolved::postgresql://test", "tenant_demo")]
+    assert calls["ensure_vector_extension"] == [("resolved::postgresql://test", "pgvector", "tenant_demo")]
+    assert calls["ensure_text_search_extension"] == [("resolved::postgresql://test", "native", "", "tenant_demo")]
+
+
+@pytest.mark.parametrize(
+    ("ensure_extensions", "expected"),
+    [(True, True), (False, False)],
+)
+@pytest.mark.asyncio
+async def test_run_migration_threads_ensure_extensions_flag(monkeypatch, ensure_extensions, expected):
+    """The --skip-extension-reconcile flag (ensure_extensions=False) must reach run_migrations_for_schemas.
+
+    The post-migration vector/text-search reconcile only does work on a backend change, so operators
+    can skip it on a no-change re-migration over many tenant schemas. Verify the flag is threaded through
+    rather than silently dropped.
+    """
+    monkeypatch.setenv("HINDSIGHT_API_DATABASE_URL", "postgresql://test")
+    captured: dict = {}
+
+    async def fake_resolve_database_url(db_url: str) -> str:
+        return f"resolved::{db_url}"
+
+    def fake_run_migrations_for_schemas(database_url, schemas, **kwargs):
+        captured["ensure_extensions"] = kwargs.get("ensure_extensions")
+
+    monkeypatch.setattr(admin_cli, "load_extension", lambda *args, **kwargs: None)
+    monkeypatch.setattr(admin_cli, "resolve_database_url", fake_resolve_database_url)
+    # Extension-table provisioning does a real connect; these tests mock the DB, so stub it.
+    monkeypatch.setattr(admin_cli, "_provision_extra_bank_tables", AsyncMock())
+
+    from hindsight_api import migrations as migrations_module
+
+    monkeypatch.setattr(migrations_module, "run_migrations_for_schemas", fake_run_migrations_for_schemas)
+
+    await admin_cli._run_migration("postgresql://test", schema="tenant_demo", ensure_extensions=ensure_extensions)
+
+    assert captured["ensure_extensions"] is expected

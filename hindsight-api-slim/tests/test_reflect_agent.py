@@ -1,0 +1,1330 @@
+"""
+Tests for the reflect agent with mocked LLM outputs.
+
+These tests verify:
+1. Tool name normalization for various LLM output formats
+2. Recovery from unknown tool calls
+3. Recovery from tool execution errors
+4. Wall-clock timeout enforcement
+"""
+
+import asyncio
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from hindsight_api.engine.llm_interface import LLM_TOOL_CHOICE_AUTO, LLMToolChoice
+from hindsight_api.engine.reflect.agent import (
+    ReflectToolCallError,
+    _all_mental_models_are_usable_and_fresh,
+    _cache_cleanup_tasks,
+    _count_messages_tokens,
+    _generate_structured_output,
+    _is_context_overflow_error,
+    _is_done_tool,
+    _normalize_tool_name,
+    run_reflect_agent,
+)
+from hindsight_api.engine.response_models import LLMToolCall, LLMToolCallResult, TokenUsage
+from tests.llm_judge import assert_meets_criteria
+
+
+class TestToolNameNormalization:
+    """Test tool name normalization for various LLM output formats."""
+
+    def test_normalize_standard_name(self):
+        """Standard tool names should pass through unchanged."""
+        assert _normalize_tool_name("done") == "done"
+        assert _normalize_tool_name("recall") == "recall"
+        assert _normalize_tool_name("search_mental_models") == "search_mental_models"
+        assert _normalize_tool_name("search_observations") == "search_observations"
+        assert _normalize_tool_name("expand") == "expand"
+
+    def test_normalize_functions_prefix(self):
+        """Tool names with 'functions.' prefix should be normalized."""
+        assert _normalize_tool_name("functions.done") == "done"
+        assert _normalize_tool_name("functions.recall") == "recall"
+        assert _normalize_tool_name("functions.search_mental_models") == "search_mental_models"
+
+    def test_normalize_call_equals_prefix(self):
+        """Tool names with 'call=' prefix should be normalized."""
+        assert _normalize_tool_name("call=done") == "done"
+        assert _normalize_tool_name("call=recall") == "recall"
+
+    def test_normalize_call_equals_functions_prefix(self):
+        """Tool names with 'call=functions.' prefix should be normalized."""
+        assert _normalize_tool_name("call=functions.done") == "done"
+        assert _normalize_tool_name("call=functions.recall") == "recall"
+        assert _normalize_tool_name("call=functions.search_observations") == "search_observations"
+
+    def test_normalize_special_token_suffix(self):
+        """Tool names with malformed special tokens should be normalized."""
+        assert _normalize_tool_name("done<|channel|>commentary") == "done"
+        assert _normalize_tool_name("recall<|endoftext|>") == "recall"
+        assert _normalize_tool_name("search_observations<|im_end|>extra") == "search_observations"
+
+    def test_is_done_tool(self):
+        """Test _is_done_tool helper."""
+        # Standard
+        assert _is_done_tool("done") is True
+        assert _is_done_tool("recall") is False
+
+        # With prefixes
+        assert _is_done_tool("functions.done") is True
+        assert _is_done_tool("call=done") is True
+        assert _is_done_tool("call=functions.done") is True
+
+        # With malformed special tokens
+        assert _is_done_tool("done<|channel|>commentary") is True
+        assert _is_done_tool("done<|endoftext|>") is True
+
+        # Not done
+        assert _is_done_tool("functions.recall") is False
+        assert _is_done_tool("call=functions.recall") is False
+        assert _is_done_tool("recall<|channel|>done") is False
+
+
+class TestMentalModelFreshnessHelper:
+    """Deterministic freshness/usability guard for short-circuiting forced retrieval."""
+
+    def test_all_fresh_and_non_empty_is_usable(self):
+        output = {
+            "mental_models": [
+                {"id": "mm-1", "content": "Fresh content.", "is_stale": False},
+                {"id": "mm-2", "content": "More fresh content.", "is_stale": False},
+            ]
+        }
+        assert _all_mental_models_are_usable_and_fresh(output) is True
+
+    def test_any_stale_model_is_not_usable(self):
+        output = {
+            "mental_models": [
+                {"id": "mm-1", "content": "Fresh content.", "is_stale": False},
+                {"id": "mm-2", "content": "Old content.", "is_stale": True},
+            ]
+        }
+        assert _all_mental_models_are_usable_and_fresh(output) is False
+
+    def test_missing_staleness_flag_is_not_usable(self):
+        # An unknown/missing staleness flag must be treated as unsafe.
+        output = {"mental_models": [{"id": "mm-1", "content": "Fresh content."}]}
+        assert _all_mental_models_are_usable_and_fresh(output) is False
+
+    def test_blank_content_is_not_usable(self):
+        output = {"mental_models": [{"id": "mm-1", "content": "   ", "is_stale": False}]}
+        assert _all_mental_models_are_usable_and_fresh(output) is False
+
+    def test_empty_list_is_vacuously_usable(self):
+        # The caller gates on a non-empty list separately; the helper itself is
+        # only responsible for freshness/content of the models it is given.
+        assert _all_mental_models_are_usable_and_fresh({"mental_models": []}) is True
+        assert _all_mental_models_are_usable_and_fresh({}) is True
+
+
+class TestReflectStructuredOutput:
+    """Tests for the second-pass structured-output extraction."""
+
+    @pytest.mark.asyncio
+    async def test_structured_output_uses_short_retry_budget(self):
+        """A provider-specific structured-output failure must not consume the full reflect timeout."""
+        llm = MagicMock()
+        llm.call = AsyncMock(side_effect=RuntimeError("empty message content: finish_reason=length"))
+
+        result = await _generate_structured_output(
+            answer="Alice prefers concise engineering updates.",
+            response_schema={
+                "type": "object",
+                "properties": {
+                    "summary": {"type": "string"},
+                },
+                "required": ["summary"],
+            },
+            llm_config=llm,
+            reflect_id="test-reflect",
+        )
+
+        assert result.structured_output is None
+        call_kwargs = llm.call.await_args.kwargs
+        assert call_kwargs["scope"] == "reflect_structured"
+        assert call_kwargs["max_retries"] == 1
+        assert call_kwargs["initial_backoff"] == 0.25
+        assert call_kwargs["max_backoff"] == 1.0
+
+    @pytest.mark.asyncio
+    async def test_structured_output_forwards_max_tokens(self):
+        """Structured extraction must receive the reflect output-token budget so
+        reasoning / preamble models do not exhaust the provider default before
+        emitting JSON (finish_reason=length, empty content -> issue #2431). The
+        plain reflect calls already pass max_completion_tokens=max_tokens; the
+        structured second pass must too."""
+        llm = MagicMock()
+        llm.call = AsyncMock(side_effect=RuntimeError("empty message content: finish_reason=length"))
+
+        await _generate_structured_output(
+            answer="Alice prefers concise engineering updates.",
+            response_schema={
+                "type": "object",
+                "properties": {"summary": {"type": "string"}},
+                "required": ["summary"],
+            },
+            llm_config=llm,
+            reflect_id="test-reflect",
+            max_tokens=4096,
+        )
+
+        call_kwargs = llm.call.await_args.kwargs
+        assert call_kwargs["max_completion_tokens"] == 4096
+
+    @pytest.mark.asyncio
+    async def test_structured_output_omits_budget_when_unset(self):
+        """With no max_tokens (default), the structured call forwards
+        max_completion_tokens=None -- which LLMProvider.call omits, exactly like
+        the plain reflect calls -- so behavior is unchanged for callers that do
+        not request a budget."""
+        llm = MagicMock()
+        llm.call = AsyncMock(side_effect=RuntimeError("boom"))
+
+        await _generate_structured_output(
+            answer="Alice prefers concise engineering updates.",
+            response_schema={
+                "type": "object",
+                "properties": {"summary": {"type": "string"}},
+                "required": ["summary"],
+            },
+            llm_config=llm,
+            reflect_id="test-reflect",
+        )
+
+        assert llm.call.await_args.kwargs.get("max_completion_tokens") is None
+
+
+class TestReflectAgentMocked:
+    """Test reflect agent with mocked LLM outputs."""
+
+    @pytest.fixture
+    def mock_llm(self):
+        """Create a mock LLM provider."""
+        llm = MagicMock()
+        llm.call_with_tools = AsyncMock()
+        # Also mock call() for final iteration fallback - returns (response, usage) tuple
+        llm.call = AsyncMock(
+            return_value=(
+                "Fallback answer from final iteration",
+                TokenUsage(input_tokens=100, output_tokens=50, total_tokens=150),
+            )
+        )
+        return llm
+
+    @pytest.fixture
+    def mock_functions(self):
+        """Create mock search/recall functions."""
+        return {
+            "search_mental_models_fn": AsyncMock(return_value={"mental_models": []}),
+            "search_observations_fn": AsyncMock(return_value={"observations": []}),
+            "recall_fn": AsyncMock(return_value={"memories": [{"id": "mem-1", "content": "test memory"}]}),
+            "expand_fn": AsyncMock(return_value={"memories": []}),
+        }
+
+    @staticmethod
+    def _mm_call(call_id: str = "1", query: str = "test query") -> LLMToolCallResult:
+        return LLMToolCallResult(
+            tool_calls=[
+                LLMToolCall(id=call_id, name="search_mental_models", arguments={"reason": "curated", "query": query})
+            ],
+            finish_reason="tool_calls",
+        )
+
+    @pytest.mark.asyncio
+    async def test_fresh_mental_model_releases_forced_retrieval(self, mock_llm, mock_functions):
+        """A fresh, usable mental model stops forced lower-level retrieval — with no extra LLM call.
+
+        The agent answers on the very next (auto) iteration, so search_observations
+        and recall are never invoked.
+        """
+        mock_functions["search_mental_models_fn"].return_value = {
+            "query": "test query",
+            "mental_models": [
+                {"id": "mm-1", "name": "User prefs", "content": "The user prefers concise answers.", "is_stale": False}
+            ],
+        }
+        mock_llm.call_with_tools.side_effect = [
+            self._mm_call(),
+            LLMToolCallResult(
+                tool_calls=[
+                    LLMToolCall(id="2", name="done", arguments={"answer": "Be concise.", "mental_model_ids": ["mm-1"]})
+                ],
+                finish_reason="tool_calls",
+            ),
+        ]
+
+        result = await run_reflect_agent(
+            llm_config=mock_llm,
+            bank_id="test-bank",
+            query="test query",
+            bank_profile={"name": "Test", "mission": "Testing"},
+            has_mental_models=True,
+            budget="low",
+            max_iterations=5,
+            **mock_functions,
+        )
+
+        assert result.text == "Be concise."
+        # The fix's whole point: no extra LLM round-trip to decide sufficiency.
+        mock_llm.call.assert_not_called()
+        mock_functions["search_observations_fn"].assert_not_called()
+        mock_functions["recall_fn"].assert_not_called()
+        # First iteration forced mental models; second was released to auto.
+        first_choice = mock_llm.call_with_tools.await_args_list[0].kwargs["tool_choice"]
+        assert first_choice == LLMToolChoice.named("search_mental_models")
+        assert mock_llm.call_with_tools.await_args_list[1].kwargs["tool_choice"] is LLM_TOOL_CHOICE_AUTO
+        tool_result = mock_llm.call_with_tools.await_args_list[1].kwargs["messages"][-1]
+        assert tool_result["role"] == "tool"
+        assert tool_result["tool_call_id"] == "1"
+        assert "name" not in tool_result
+
+    @pytest.mark.asyncio
+    async def test_done_tool_answer_respects_max_tokens(self, mock_llm, mock_functions):
+        mock_functions["search_mental_models_fn"].return_value = {
+            "mental_models": [{"id": "mm-1", "name": "User prefs", "content": "Fresh content.", "is_stale": False}]
+        }
+        mock_llm.call_with_tools.side_effect = [
+            self._mm_call(),
+            LLMToolCallResult(
+                tool_calls=[
+                    LLMToolCall(
+                        id="2",
+                        name="done",
+                        arguments={"answer": "important detail " * 100, "mental_model_ids": ["mm-1"]},
+                    )
+                ],
+                finish_reason="tool_calls",
+            ),
+        ]
+
+        result = await run_reflect_agent(
+            llm_config=mock_llm,
+            bank_id="test-bank",
+            query="test query",
+            bank_profile={"name": "Test", "mission": "Testing"},
+            has_mental_models=True,
+            budget="low",
+            max_iterations=5,
+            max_tokens=8,
+            **mock_functions,
+        )
+
+        assert result.text == "Fallback answer from final iteration"
+        assert mock_llm.call.await_args.kwargs["max_completion_tokens"] == 8
+        assert result.usage.total_tokens == 150
+        assert result.llm_trace[-1].scope == "final_rewrite"
+
+    @pytest.mark.asyncio
+    async def test_no_tool_call_ever_raises_tool_call_error(self, mock_llm, mock_functions):
+        """A transport that strips tool support (never yields a tool call) fails loudly.
+
+        This is the harmony/gpt-oss-via-Vertex-MaaS case: the model returns free text
+        that mimics a done() payload with sibling id fields. We must NOT salvage it as
+        the answer -- reflect raises ReflectToolCallError instead.
+        """
+        mock_llm.provider = "litellm"
+        mock_llm.model = "vertex_ai/openai/gpt-oss-120b-maas"
+        leaked = '{"answer": "The user has a cat named Luna.", "memory_ids": ["mem-1"], "observation_ids": []}'
+        mock_llm.call_with_tools.side_effect = [
+            LLMToolCallResult(content=leaked, tool_calls=[], finish_reason="stop"),
+        ]
+
+        with pytest.raises(ReflectToolCallError) as exc_info:
+            await run_reflect_agent(
+                llm_config=mock_llm,
+                bank_id="test-bank",
+                query="what pets does the user have?",
+                bank_profile={"name": "Test", "mission": "Testing"},
+                has_mental_models=True,
+                budget="low",
+                max_iterations=5,
+                **mock_functions,
+            )
+
+        msg = str(exc_info.value)
+        assert "vertex_ai/openai/gpt-oss-120b-maas" in msg
+        assert "no usable tool call" in msg
+        # The forced-final fallback (mock_llm.call) must NOT have run: we fail fast
+        # rather than synthesizing a hollow answer from zero evidence.
+        mock_llm.call.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_short_circuited_agent_may_still_retrieve_under_auto(self, mock_llm, mock_functions):
+        """After release, the agent can still choose to retrieve deeper itself (its own query)."""
+        mock_functions["search_mental_models_fn"].return_value = {
+            "query": "test query",
+            "mental_models": [
+                {"id": "mm-1", "name": "Status", "content": "Launch was planned for Friday.", "is_stale": False}
+            ],
+        }
+        mock_llm.call_with_tools.side_effect = [
+            self._mm_call(),
+            LLMToolCallResult(
+                tool_calls=[
+                    LLMToolCall(
+                        id="2", name="recall", arguments={"reason": "verify", "query": "launch completion proof"}
+                    )
+                ],
+                finish_reason="tool_calls",
+            ),
+            LLMToolCallResult(
+                tool_calls=[
+                    LLMToolCall(id="3", name="done", arguments={"answer": "Confirmed.", "memory_ids": ["mem-1"]})
+                ],
+                finish_reason="tool_calls",
+            ),
+        ]
+
+        result = await run_reflect_agent(
+            llm_config=mock_llm,
+            bank_id="test-bank",
+            query="test query",
+            bank_profile={"name": "Test", "mission": "Testing"},
+            has_mental_models=True,
+            budget="low",
+            max_iterations=5,
+            **mock_functions,
+        )
+
+        assert result.text == "Confirmed."
+        # recall ran because the model chose it under auto, not because it was forced,
+        # and it used the model's own targeted query (not a forced override).
+        assert mock_llm.call_with_tools.await_args_list[1].kwargs["tool_choice"] is LLM_TOOL_CHOICE_AUTO
+        mock_functions["recall_fn"].assert_called_once()
+        assert mock_functions["recall_fn"].await_args.args[0] == "launch completion proof"
+        mock_functions["search_observations_fn"].assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stale_mental_model_keeps_forced_retrieval(self, mock_llm, mock_functions):
+        """A stale mental model must not short-circuit; the full forced path continues."""
+        mock_functions["search_mental_models_fn"].return_value = {
+            "query": "test query",
+            "mental_models": [
+                {
+                    "id": "mm-1",
+                    "name": "Old status",
+                    "content": "Old summary.",
+                    "is_stale": True,
+                    "staleness_reason": "newer facts exist",
+                }
+            ],
+        }
+        mock_llm.call_with_tools.side_effect = [
+            self._mm_call(),
+            LLMToolCallResult(
+                tool_calls=[LLMToolCall(id="2", name="search_observations", arguments={"query": "q"})],
+                finish_reason="tool_calls",
+            ),
+            LLMToolCallResult(
+                tool_calls=[LLMToolCall(id="3", name="recall", arguments={"query": "q"})],
+                finish_reason="tool_calls",
+            ),
+            LLMToolCallResult(
+                tool_calls=[
+                    LLMToolCall(id="4", name="done", arguments={"answer": "Verified.", "memory_ids": ["mem-1"]})
+                ],
+                finish_reason="tool_calls",
+            ),
+        ]
+
+        result = await run_reflect_agent(
+            llm_config=mock_llm,
+            bank_id="test-bank",
+            query="test query",
+            bank_profile={"name": "Test", "mission": "Testing"},
+            has_mental_models=True,
+            budget="low",
+            max_iterations=5,
+            **mock_functions,
+        )
+
+        assert result.text == "Verified."
+        mock_functions["search_observations_fn"].assert_called_once()
+        mock_functions["recall_fn"].assert_called_once()
+        choices = [c.kwargs["tool_choice"] for c in mock_llm.call_with_tools.await_args_list[:3]]
+        assert choices == [
+            LLMToolChoice.named("search_mental_models"),
+            LLMToolChoice.named("search_observations"),
+            LLMToolChoice.named("recall"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_high_budget_keeps_forced_path_for_fresh_mental_model(self, mock_llm, mock_functions):
+        """High budget preserves the full verification path even for fresh mental models."""
+        mock_functions["search_mental_models_fn"].return_value = {
+            "query": "test query",
+            "mental_models": [
+                {"id": "mm-1", "name": "Prefs", "content": "Fresh and directly relevant.", "is_stale": False}
+            ],
+        }
+        mock_llm.call_with_tools.side_effect = [
+            self._mm_call(),
+            LLMToolCallResult(
+                tool_calls=[LLMToolCall(id="2", name="search_observations", arguments={"query": "q"})],
+                finish_reason="tool_calls",
+            ),
+            LLMToolCallResult(
+                tool_calls=[LLMToolCall(id="3", name="recall", arguments={"query": "q"})],
+                finish_reason="tool_calls",
+            ),
+            LLMToolCallResult(
+                tool_calls=[
+                    LLMToolCall(id="4", name="done", arguments={"answer": "Verified.", "memory_ids": ["mem-1"]})
+                ],
+                finish_reason="tool_calls",
+            ),
+        ]
+
+        result = await run_reflect_agent(
+            llm_config=mock_llm,
+            bank_id="test-bank",
+            query="test query",
+            bank_profile={"name": "Test", "mission": "Testing"},
+            has_mental_models=True,
+            budget="high",
+            max_iterations=5,
+            **mock_functions,
+        )
+
+        assert result.text == "Verified."
+        mock_functions["search_observations_fn"].assert_called_once()
+        mock_functions["recall_fn"].assert_called_once()
+        assert mock_llm.call_with_tools.await_args_list[1].kwargs["tool_choice"] == LLMToolChoice.named(
+            "search_observations"
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_mental_models_keeps_forced_retrieval(self, mock_llm, mock_functions):
+        """An empty mental-model result must not short-circuit the forced path."""
+        mock_functions["search_mental_models_fn"].return_value = {"query": "test query", "mental_models": []}
+        mock_llm.call_with_tools.side_effect = [
+            self._mm_call(),
+            LLMToolCallResult(
+                tool_calls=[LLMToolCall(id="2", name="search_observations", arguments={"query": "q"})],
+                finish_reason="tool_calls",
+            ),
+            LLMToolCallResult(
+                tool_calls=[LLMToolCall(id="3", name="recall", arguments={"query": "q"})],
+                finish_reason="tool_calls",
+            ),
+            LLMToolCallResult(
+                tool_calls=[LLMToolCall(id="4", name="done", arguments={"answer": "Done.", "memory_ids": ["mem-1"]})],
+                finish_reason="tool_calls",
+            ),
+        ]
+
+        result = await run_reflect_agent(
+            llm_config=mock_llm,
+            bank_id="test-bank",
+            query="test query",
+            bank_profile={"name": "Test", "mission": "Testing"},
+            has_mental_models=True,
+            budget="low",
+            max_iterations=5,
+            **mock_functions,
+        )
+
+        assert result.text == "Done."
+        mock_functions["search_observations_fn"].assert_called_once()
+        mock_functions["recall_fn"].assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_handles_functions_prefix_in_done(self, mock_llm, mock_functions):
+        """Test that 'functions.done' is handled correctly."""
+        # First call: LLM calls recall
+        # Second call: LLM calls functions.done
+        mock_llm.call_with_tools.side_effect = [
+            LLMToolCallResult(
+                tool_calls=[LLMToolCall(id="1", name="recall", arguments={"query": "test"})],
+                finish_reason="tool_calls",
+            ),
+            LLMToolCallResult(
+                tool_calls=[
+                    LLMToolCall(
+                        id="2",
+                        name="functions.done",
+                        arguments={"answer": "Test answer", "memory_ids": ["mem-1"]},
+                    )
+                ],
+                finish_reason="tool_calls",
+            ),
+        ]
+
+        result = await run_reflect_agent(
+            llm_config=mock_llm,
+            bank_id="test-bank",
+            query="test query",
+            bank_profile={"name": "Test", "mission": "Testing"},
+            **mock_functions,
+        )
+
+        assert result.text == "Test answer"
+        assert "mem-1" in result.used_memory_ids
+
+    @pytest.mark.asyncio
+    async def test_handles_call_equals_functions_prefix(self, mock_llm, mock_functions):
+        """Test that 'call=functions.done' is handled correctly."""
+        mock_llm.call_with_tools.side_effect = [
+            LLMToolCallResult(
+                tool_calls=[LLMToolCall(id="1", name="recall", arguments={"query": "test"})],
+                finish_reason="tool_calls",
+            ),
+            LLMToolCallResult(
+                tool_calls=[
+                    LLMToolCall(
+                        id="2",
+                        name="call=functions.done",
+                        arguments={"answer": "Test answer", "memory_ids": ["mem-1"]},
+                    )
+                ],
+                finish_reason="tool_calls",
+            ),
+        ]
+
+        result = await run_reflect_agent(
+            llm_config=mock_llm,
+            bank_id="test-bank",
+            query="test query",
+            bank_profile={"name": "Test", "mission": "Testing"},
+            **mock_functions,
+        )
+
+        assert result.text == "Test answer"
+
+    @pytest.mark.asyncio
+    async def test_recovery_from_unknown_tool(self, mock_llm, mock_functions):
+        """Test that LLM can recover after calling an unknown tool."""
+        # First call: LLM calls unknown tool
+        # Second call: LLM calls valid recall after seeing error
+        # Third call: LLM calls done
+        mock_llm.call_with_tools.side_effect = [
+            LLMToolCallResult(
+                tool_calls=[LLMToolCall(id="1", name="invalid_tool", arguments={"foo": "bar"})],
+                finish_reason="tool_calls",
+            ),
+            LLMToolCallResult(
+                tool_calls=[LLMToolCall(id="2", name="recall", arguments={"query": "test"})],
+                finish_reason="tool_calls",
+            ),
+            LLMToolCallResult(
+                tool_calls=[
+                    LLMToolCall(
+                        id="3",
+                        name="done",
+                        arguments={"answer": "Recovered successfully", "memory_ids": ["mem-1"]},
+                    )
+                ],
+                finish_reason="tool_calls",
+            ),
+        ]
+
+        result = await run_reflect_agent(
+            llm_config=mock_llm,
+            bank_id="test-bank",
+            query="test query",
+            bank_profile={"name": "Test", "mission": "Testing"},
+            **mock_functions,
+        )
+
+        assert result.text == "Recovered successfully"
+        # Verify the LLM was called 3 times (initial + recovery + done)
+        assert mock_llm.call_with_tools.call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_recovery_from_tool_execution_error(self, mock_llm, mock_functions):
+        """Test that LLM can recover after a tool execution fails."""
+        # Make recall fail the first time, succeed the second time
+        mock_functions["recall_fn"].side_effect = [
+            Exception("Database connection failed"),
+            {"memories": [{"id": "mem-1", "content": "test memory"}]},
+        ]
+
+        mock_llm.call_with_tools.side_effect = [
+            LLMToolCallResult(
+                tool_calls=[LLMToolCall(id="1", name="recall", arguments={"query": "test"})],
+                finish_reason="tool_calls",
+            ),
+            # LLM tries again after seeing error
+            LLMToolCallResult(
+                tool_calls=[LLMToolCall(id="2", name="recall", arguments={"query": "test retry"})],
+                finish_reason="tool_calls",
+            ),
+            LLMToolCallResult(
+                tool_calls=[
+                    LLMToolCall(
+                        id="3",
+                        name="done",
+                        arguments={"answer": "Recovered from error", "memory_ids": ["mem-1"]},
+                    )
+                ],
+                finish_reason="tool_calls",
+            ),
+        ]
+
+        result = await run_reflect_agent(
+            llm_config=mock_llm,
+            bank_id="test-bank",
+            query="test query",
+            bank_profile={"name": "Test", "mission": "Testing"},
+            **mock_functions,
+        )
+
+        assert result.text == "Recovered from error"
+        assert mock_llm.call_with_tools.call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_normalizes_tool_names_in_other_tools(self, mock_llm, mock_functions):
+        """Test that tool names are normalized for all tools, not just done."""
+        mock_llm.call_with_tools.side_effect = [
+            # LLM calls 'functions.recall' instead of 'recall'
+            LLMToolCallResult(
+                tool_calls=[LLMToolCall(id="1", name="functions.recall", arguments={"query": "test"})],
+                finish_reason="tool_calls",
+            ),
+            LLMToolCallResult(
+                tool_calls=[
+                    LLMToolCall(
+                        id="2",
+                        name="done",
+                        arguments={"answer": "Test answer", "memory_ids": ["mem-1"]},
+                    )
+                ],
+                finish_reason="tool_calls",
+            ),
+        ]
+
+        result = await run_reflect_agent(
+            llm_config=mock_llm,
+            bank_id="test-bank",
+            query="test query",
+            bank_profile={"name": "Test", "mission": "Testing"},
+            **mock_functions,
+        )
+
+        assert result.text == "Test answer"
+        # Verify recall was actually called (normalization worked)
+        mock_functions["recall_fn"].assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_stop_after_evidence_uses_forced_final_synthesis(self, mock_llm, mock_functions):
+        """A model that tool-called at least once and then stops (no tool call) is a
+        legitimate completion: reflect does a clean forced final-synthesis call (tools
+        disabled) rather than salvaging free text or raising ReflectToolCallError.
+        """
+        mock_functions["search_mental_models_fn"].return_value = {
+            "mental_models": [{"id": "mm-1", "name": "Prefs", "content": "Fresh content.", "is_stale": False}]
+        }
+        mock_llm.call_with_tools.side_effect = [
+            # Turn 0: a real tool call -> saw_tool_call becomes True.
+            self._mm_call(),
+            # Turn 1: model stops with plain text and no tool call.
+            LLMToolCallResult(tool_calls=[], content="I have enough to answer.", finish_reason="stop"),
+        ]
+        mock_llm.call = AsyncMock(
+            return_value=(
+                "Synthesized final answer.",
+                TokenUsage(input_tokens=40, output_tokens=12, total_tokens=52),
+            )
+        )
+
+        cap = 64
+        result = await run_reflect_agent(
+            llm_config=mock_llm,
+            bank_id="test-bank",
+            query="test query",
+            bank_profile={"name": "Test", "mission": "Testing"},
+            has_mental_models=True,
+            budget="low",
+            max_tokens=cap,
+            **mock_functions,
+        )
+
+        # Answer comes from the clean forced-final call, not the turn-1 free text.
+        assert result.text == "Synthesized final answer."
+        assert mock_llm.call.await_count == 1
+        # The forced-final synthesis respects the token cap directly on the call.
+        assert mock_llm.call.await_args.kwargs["max_completion_tokens"] == cap
+
+    @pytest.mark.asyncio
+    async def test_max_iterations_reached(self, mock_llm, mock_functions):
+        """Test that agent stops after max iterations even with errors."""
+        # LLM keeps calling unknown tools
+        mock_llm.call_with_tools.return_value = LLMToolCallResult(
+            tool_calls=[LLMToolCall(id="1", name="unknown_tool", arguments={})],
+            finish_reason="tool_calls",
+        )
+
+        result = await run_reflect_agent(
+            llm_config=mock_llm,
+            bank_id="test-bank",
+            query="test query",
+            bank_profile={"name": "Test", "mission": "Testing"},
+            max_iterations=3,
+            **mock_functions,
+        )
+
+        # Should have a result even if no memories found
+        assert result is not None
+        assert result.iterations == 3
+
+    @pytest.mark.asyncio
+    async def test_wall_clock_timeout(self, mock_llm: MagicMock, mock_functions: dict[str, AsyncMock]) -> None:
+        """Test that asyncio.wait_for can enforce a wall-clock timeout on run_reflect_agent."""
+
+        async def slow_llm_call(*args: object, **kwargs: object) -> LLMToolCallResult:
+            await asyncio.sleep(10)  # Simulate a slow LLM call
+            return LLMToolCallResult(
+                tool_calls=[LLMToolCall(id="1", name="recall", arguments={"query": "test"})],
+                finish_reason="tool_calls",
+            )
+
+        mock_llm.call_with_tools.side_effect = slow_llm_call
+
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(
+                run_reflect_agent(
+                    llm_config=mock_llm,
+                    bank_id="test-bank",
+                    query="test query",
+                    bank_profile={"name": "Test", "mission": "Testing"},
+                    max_iterations=5,
+                    **mock_functions,
+                ),
+                timeout=0.1,  # Very short timeout to trigger quickly
+            )
+
+
+class TestContextOverflowHelpers:
+    """Unit tests for context-overflow detection helpers."""
+
+    def test_count_messages_tokens_basic(self):
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "What is the capital of France?"},
+        ]
+        count = _count_messages_tokens(messages)
+        assert count > 0
+        # Rough sanity check: ~10 tokens for each message
+        assert count < 100
+
+    def test_count_messages_tokens_with_tool_result(self):
+        """A large tool result should substantially increase the count."""
+        small_messages = [{"role": "user", "content": "hi"}]
+        large_messages = [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "tool",
+                "tool_call_id": "x",
+                "content": '{"memories": ['
+                + ", ".join(
+                    [
+                        f'{{"id": "m{i}", "content": "A long memory fact about some topic that goes on and on."}}'
+                        for i in range(50)
+                    ]
+                )
+                + "]}",
+            },
+        ]
+        small = _count_messages_tokens(small_messages)
+        large = _count_messages_tokens(large_messages)
+        assert large > small + 200
+
+    def test_is_context_overflow_error_openai(self):
+        assert _is_context_overflow_error(Exception("context_length_exceeded: too many tokens"))
+        assert _is_context_overflow_error(
+            Exception(
+                "This model's maximum context length is 128000 tokens. However, your messages resulted in 142164 tokens."
+            )
+        )
+
+    def test_is_context_overflow_error_anthropic(self):
+        assert _is_context_overflow_error(Exception("prompt_too_long"))
+        assert _is_context_overflow_error(Exception("prompt is too long for this model"))
+
+    def test_is_context_overflow_error_gemini(self):
+        assert _is_context_overflow_error(Exception("RESOURCE_EXHAUSTED: quota exceeded"))
+
+    def test_is_context_overflow_error_generic(self):
+        assert _is_context_overflow_error(Exception("input is too long to process"))
+        assert _is_context_overflow_error(Exception("too many tokens in the request"))
+
+    def test_is_context_overflow_error_unrelated(self):
+        assert not _is_context_overflow_error(Exception("connection timeout"))
+        assert not _is_context_overflow_error(Exception("rate limit exceeded"))
+        assert not _is_context_overflow_error(ValueError("invalid argument"))
+
+
+class TestContextOverflowBehavior:
+    """Test that the reflect agent handles context overflow gracefully."""
+
+    @pytest.fixture
+    def mock_llm(self):
+        llm = MagicMock()
+        llm.call_with_tools = AsyncMock()
+        llm.call = AsyncMock(
+            return_value=(
+                "Synthesized answer from gathered evidence.",
+                TokenUsage(input_tokens=50, output_tokens=20, total_tokens=70),
+            )
+        )
+        return llm
+
+    @pytest.fixture
+    def mock_functions_with_large_output(self):
+        """Mock functions that return a large enough payload to exceed a tiny token budget."""
+        large_memories = [{"id": f"mem-{i}", "content": f"Memory fact number {i}: " + "A" * 200} for i in range(20)]
+        return {
+            "search_mental_models_fn": AsyncMock(return_value={"mental_models": []}),
+            "search_observations_fn": AsyncMock(return_value={"observations": []}),
+            "recall_fn": AsyncMock(return_value={"memories": large_memories}),
+            "expand_fn": AsyncMock(return_value={"memories": []}),
+        }
+
+    @pytest.mark.asyncio
+    async def test_proactive_guard_fires_when_budget_exceeded(self, mock_llm, mock_functions_with_large_output):
+        """When token count exceeds max_context_tokens after a tool call, the agent
+        should immediately synthesize from gathered evidence instead of making
+        another LLM call that would overflow."""
+        # First call: LLM calls recall (forced by iter 0 with no mental models)
+        mock_llm.call_with_tools.return_value = LLMToolCallResult(
+            tool_calls=[LLMToolCall(id="1", name="recall", arguments={"query": "test"})],
+            finish_reason="tool_calls",
+        )
+
+        # Set a tiny token budget — the recall result alone will blow past it
+        result = await run_reflect_agent(
+            llm_config=mock_llm,
+            bank_id="test-bank",
+            query="What do you know?",
+            bank_profile={"name": "Test", "mission": "Testing"},
+            max_context_tokens=100,
+            **mock_functions_with_large_output,
+        )
+
+        assert result.text == "Synthesized answer from gathered evidence."
+        # call_with_tools was called once (for the forced recall), then the guard
+        # kicked in — no further tool-call iterations
+        assert mock_llm.call_with_tools.call_count == 1
+        # llm.call() was invoked to generate the final synthesis
+        mock_llm.call.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_context_overflow_error_skips_retry(self, mock_llm, mock_functions_with_large_output):
+        """A context_length_exceeded error from the LLM should NOT be retried —
+        it should immediately fall back to final synthesis."""
+        mock_llm.call_with_tools.side_effect = Exception("context_length_exceeded: messages resulted in 150000 tokens.")
+
+        result = await run_reflect_agent(
+            llm_config=mock_llm,
+            bank_id="test-bank",
+            query="What do you know?",
+            bank_profile={"name": "Test", "mission": "Testing"},
+            max_iterations=5,
+            **mock_functions_with_large_output,
+        )
+
+        assert result is not None
+        # Should have attempted only 1 iteration (no retry on overflow error)
+        assert mock_llm.call_with_tools.call_count == 1
+        # Final synthesis was called
+        mock_llm.call.assert_called_once()
+
+
+class TestDirectiveLeakageOnEmptyBank:
+    """Test that directives don't leak into the answer when the bank has no data.
+
+    Uses a real LLM to verify the behaviour end-to-end.
+    """
+
+    @pytest.mark.asyncio
+    async def test_directive_not_echoed_on_empty_bank(self, memory, request_context):
+        """When a bank has a directive but zero memories, reflect must NOT
+        parrot the directive text back as its answer.
+        """
+        import uuid
+
+        directive_text = (
+            "When making SEO or content decisions, prefer observed performance data "
+            "over industry best practices. Always check the Content Performance page "
+            "before recommending a format or approach."
+        )
+
+        bank_id = f"test-directive-leak-{uuid.uuid4().hex[:8]}"
+        try:
+            # Ensure bank exists (auto-creates it), but retain nothing.
+            await memory.get_bank_profile(bank_id, request_context=request_context)
+
+            await memory.create_directive(
+                bank_id=bank_id,
+                name="SEO Directive",
+                content=directive_text,
+                request_context=request_context,
+            )
+
+            result = await memory.reflect_async(
+                bank_id=bank_id,
+                query="What content strategy should we use?",
+                request_context=request_context,
+            )
+
+            # The directive content must NOT leak into the answer.
+            assert directive_text not in result.text, (
+                f"Directive content leaked into the answer verbatim. Got: {result.text!r}"
+            )
+        finally:
+            await memory.delete_bank(bank_id, request_context=request_context)
+
+
+@pytest.mark.hs_llm_core
+class TestContextOverflowIntegration:
+    """Integration test: real LLM with a very small max_context_tokens.
+
+    The agent will make one real LLM call (forced tool choice), receive a large
+    tool result that exceeds the tiny budget, then synthesize from it via a second
+    real LLM call — all without raising a context_length_exceeded error.
+    """
+
+    @pytest.fixture
+    def memory(self, memory_real_llm):
+        """Override to use real LLM for this class."""
+        return memory_real_llm
+
+    @pytest.mark.asyncio
+    async def test_reflect_completes_with_tiny_context_budget(self, memory, request_context):
+        """End-to-end: reflect on a bank with max_context_tokens=1 (tiny budget).
+
+        Setting max_context_tokens=1 guarantees the proactive guard fires as soon
+        as the first tool result is received and evidence is available.
+        The result must be a non-empty string with no exception raised.
+        """
+        import uuid
+        from unittest.mock import patch
+
+        bank_id = f"test-ctx-overflow-{uuid.uuid4().hex[:8]}"
+        try:
+            # Retain a handful of facts so the recall tool has something to return
+            await memory.retain_async(
+                bank_id=bank_id,
+                content="Alice is a software engineer who enjoys hiking on weekends.",
+                request_context=request_context,
+            )
+            await memory.retain_async(
+                bank_id=bank_id,
+                content="Bob is a designer who loves cooking Italian food.",
+                request_context=request_context,
+            )
+
+            # Patch get_config where memory_engine uses it, injecting a tiny
+            # max_context_tokens.  Everything else delegates to the real config.
+            from hindsight_api.config import get_config as _real_get_config
+
+            class _TinyContextProxy:
+                """Forwards all attribute access to the real config proxy except
+                reflect_max_context_tokens which is forced to 1."""
+
+                _real = _real_get_config()
+
+                def __getattr__(self, name: str):
+                    if name == "reflect_max_context_tokens":
+                        return 1
+                    return getattr(self._real, name)
+
+            with patch("hindsight_api.engine.memory_engine.get_config", return_value=_TinyContextProxy()):
+                result = await memory.reflect_async(
+                    bank_id=bank_id,
+                    query="Tell me about the people you know.",
+                    request_context=request_context,
+                )
+
+            assert result.text, "reflect must return a non-empty answer"
+            assert result.usage.total_tokens > 0
+
+        finally:
+            await memory.delete_bank(bank_id, request_context=request_context)
+
+
+@pytest.mark.hs_llm_core
+@pytest.mark.flaky(reruns=3, reruns_delay=2)
+class TestMentalModelShortCircuitRealLLM:
+    """End-to-end, real-LLM coverage for the fresh-mental-model short-circuit.
+
+    The deterministic release-to-auto mechanism is covered by the MockLLM tests
+    above. What only a real model can verify is the behaviour *after* release:
+    that a real agent, once it is no longer forced, actually answers off a fresh
+    sufficient mental model — and, when the model is fresh but incomplete, that
+    it chooses to retrieve deeper itself with its own targeted query.
+
+    The search functions are stubbed so the mental-model content is controlled,
+    but ``llm_config`` drives the real agent loop.
+    """
+
+    @staticmethod
+    def _stub_functions(mental_models, recall_memories=None, observations=None):
+        async def search_mental_models_fn(query, max_results):
+            return {"query": query, "count": len(mental_models), "mental_models": mental_models}
+
+        return {
+            "search_mental_models_fn": AsyncMock(side_effect=search_mental_models_fn),
+            "search_observations_fn": AsyncMock(return_value={"observations": observations or []}),
+            "recall_fn": AsyncMock(return_value={"memories": recall_memories or []}),
+            "expand_fn": AsyncMock(return_value={"memories": []}),
+        }
+
+    @pytest.mark.asyncio
+    async def test_real_fresh_mental_model_answers_without_lower_retrieval(self, llm_config):
+        """A fresh, sufficient mental model lets the real agent answer without obs/recall."""
+        functions = self._stub_functions(
+            mental_models=[
+                {
+                    "id": "mm-comm",
+                    "name": "Architecture Communication Preference",
+                    "content": (
+                        "For architecture decisions, the team prefers asynchronous written communication. "
+                        "They use concise ADRs (Architecture Decision Records) and explicitly avoid settling "
+                        "complex design questions in live meetings."
+                    ),
+                    "relevance": 0.94,
+                    "is_stale": False,
+                }
+            ]
+        )
+
+        result = await run_reflect_agent(
+            llm_config=llm_config,
+            bank_id="test-bank",
+            query="According to what you know, how does the team prefer to communicate about architecture decisions?",
+            bank_profile={"name": "Test", "mission": "Answer from curated knowledge"},
+            has_mental_models=True,
+            include_observations=True,
+            include_recall=True,
+            budget="low",
+            max_iterations=6,
+            **functions,
+        )
+
+        assert result.text, "agent must return a non-empty answer"
+        # The core behavioural win: the forced lower-level path was released, and a
+        # real model answered off the fresh mental model instead of digging deeper.
+        functions["search_observations_fn"].assert_not_called()
+        functions["recall_fn"].assert_not_called()
+        await assert_meets_criteria(
+            response=result.text,
+            criteria=(
+                "The answer states the team prefers asynchronous written communication for architecture "
+                "decisions (e.g. ADRs) rather than live meetings."
+            ),
+            context="The only knowledge available was a mental model describing the team's async/ADR preference.",
+        )
+
+    @pytest.mark.asyncio
+    async def test_real_stale_mental_model_forces_and_grounds_in_deeper_evidence(self, llm_config):
+        """A stale mental model must NOT short-circuit: the agent is forced deeper and grounds its answer there.
+
+        This is the safety side of the guard. Forcing the lower layers is
+        deterministic (stale fails the freshness check), so observations/recall
+        run regardless of model discretion; the real-LLM value is confirming the
+        agent corrects the stale summary using the freshly retrieved raw fact.
+        """
+        functions = self._stub_functions(
+            mental_models=[
+                {
+                    "id": "mm-aurora",
+                    "name": "Project Aurora Launch Plan",
+                    "content": "Project Aurora's launch is still pending and has not happened yet.",
+                    "relevance": 0.91,
+                    "is_stale": True,
+                    "staleness_reason": "newer deployment facts exist",
+                }
+            ],
+            recall_memories=[
+                {
+                    "id": "mem-deploy",
+                    "content": "Project Aurora shipped to production on Friday at 16:00 UTC (deploy log A-1029).",
+                }
+            ],
+            observations=[
+                {
+                    "id": "obs-deploy",
+                    "content": "Aurora production deployment confirmed Friday; see deploy log A-1029.",
+                }
+            ],
+        )
+
+        result = await run_reflect_agent(
+            llm_config=llm_config,
+            bank_id="test-bank",
+            query="What is the current status of Project Aurora, and what concrete fact supports it?",
+            bank_profile={"name": "Test", "mission": "Answer with verifiable detail"},
+            has_mental_models=True,
+            include_observations=True,
+            include_recall=True,
+            budget="low",
+            max_iterations=6,
+            **functions,
+        )
+
+        assert result.text, "agent must return a non-empty answer"
+        # Stale mental model → no short-circuit → lower layers are still forced.
+        assert functions["search_observations_fn"].await_count > 0
+        assert functions["recall_fn"].await_count > 0
+        await assert_meets_criteria(
+            response=result.text,
+            criteria=(
+                "The answer states Project Aurora has launched/shipped to production (NOT that it is still "
+                "pending) and cites the Friday production deployment (e.g. deploy log A-1029) as support."
+            ),
+            context="A stale mental model claimed the launch was still pending, but the freshly retrieved raw "
+            "fact (deploy log A-1029) shows it shipped on Friday. The agent should correct the stale summary.",
+        )
+
+
+class _StepCacheProvider:
+    """Fake provider that records the step-by-step incremental-cache protocol.
+
+    Serves as both ``llm_config`` and its own ``_provider_impl``: the reflect loop
+    reaches the cache methods via ``llm_config._provider_impl`` and issues LLM
+    turns via ``llm_config.call_with_tools``. Every ``call_with_tools`` records the
+    ``cached_prefix`` / ``cached_prefix_message_count`` it was handed, so a test
+    can assert that each ``auto`` turn reuses exactly the previous turn's full
+    input and that the caches are torn down at the end.
+    """
+
+    def __init__(self, scripted: list[LLMToolCallResult]):
+        self._scripted = scripted
+        self._i = 0
+        self._provider_impl = self
+        self.cache_counter = 0
+        self.created: list[tuple[str, int]] = []  # (session_id, #messages covered)
+        self.deleted_sessions: list[str] = []
+        self.calls: list[dict] = []  # per call_with_tools: tool_choice / cached_prefix / count / #messages
+
+    # -- incremental cache capability --
+    def supports_incremental_prompt_cache(self) -> bool:
+        return True
+
+    async def create_incremental_cache(self, *, session_id, messages, tools=None):
+        self.cache_counter += 1
+        self.created.append((session_id, len(messages)))
+        return f"cache-{self.cache_counter}"
+
+    async def delete_cached_prefix(self, name):  # pragma: no cover - not exercised here
+        pass
+
+    async def delete_cache_session(self, session_id):
+        self.deleted_sessions.append(session_id)
+
+    # -- llm surface --
+    async def call_with_tools(
+        self,
+        *,
+        messages,
+        tools,
+        scope="tools",
+        tool_choice="auto",
+        cached_prefix=None,
+        cached_prefix_message_count=0,
+        **_,
+    ):
+        self.calls.append(
+            {
+                "tool_choice": tool_choice,
+                "cached_prefix": cached_prefix,
+                "cached_prefix_message_count": cached_prefix_message_count,
+                "n_messages": len(messages),
+            }
+        )
+        res = self._scripted[self._i]
+        self._i += 1
+        return res
+
+    async def call(self, *args, **kwargs):  # final-synthesis fallback (unused on the happy path)
+        return ("final", TokenUsage(input_tokens=1, output_tokens=1, total_tokens=2))
+
+
+class TestReflectIncrementalCache:
+    """The step-by-step Gemini context cache: each auto turn reuses the previous
+    turn's full input, and every per-reflect cache is deleted at the end."""
+
+    @pytest.mark.asyncio
+    async def test_each_auto_turn_reuses_previous_step_cache_and_cleans_up(self):
+        functions = {
+            "search_observations_fn": AsyncMock(return_value={"observations": [{"id": "obs-1"}]}),
+            "recall_fn": AsyncMock(return_value={"memories": [{"id": "mem-1", "content": "x"}]}),
+            "search_mental_models_fn": AsyncMock(return_value={"mental_models": []}),
+            "expand_fn": AsyncMock(return_value={"memories": []}),
+        }
+
+        def _tc(cid, name):
+            # A real query arg so the stubbed tools return evidence (not an
+            # error), which lets the terminal ``done`` call be accepted.
+            return LLMToolCallResult(
+                tool_calls=[LLMToolCall(id=cid, name=name, arguments={"query": "q"})], finish_reason="tool_calls"
+            )
+
+        # Forced obs -> forced recall -> two auto recalls -> done.
+        provider = _StepCacheProvider(
+            scripted=[
+                _tc("0", "search_observations"),
+                _tc("1", "recall"),
+                _tc("2", "recall"),
+                _tc("3", "recall"),
+                LLMToolCallResult(
+                    tool_calls=[LLMToolCall(id="4", name="done", arguments={"answer": "A", "memory_ids": ["mem-1"]})],
+                    finish_reason="tool_calls",
+                ),
+            ]
+        )
+
+        result = await run_reflect_agent(
+            llm_config=provider,
+            bank_id="cache-bank",
+            query="q",
+            bank_profile={"name": "T", "mission": "M"},
+            has_mental_models=False,
+            include_observations=True,
+            include_recall=True,
+            budget="high",  # keep the full forced path (no early release) so counts are deterministic
+            max_iterations=8,
+            **functions,
+        )
+        assert result.text == "A"
+
+        calls = provider.calls
+        # 2 forced turns (obs, recall) then 3 auto turns (recall, recall, done).
+        assert [c["tool_choice"] for c in calls[:2]] == [
+            LLMToolChoice.named("search_observations"),
+            LLMToolChoice.named("recall"),
+        ]
+        assert all(c["tool_choice"] is LLM_TOOL_CHOICE_AUTO for c in calls[2:])
+
+        # Forced turns never reference a cache (Gemini forbids cache + tool_config).
+        assert calls[0]["cached_prefix"] is None
+        assert calls[1]["cached_prefix"] is None
+
+        # Every auto turn references a cache, and the count it was handed equals the
+        # PREVIOUS turn's full input length — i.e. it reuses the previous step entirely.
+        for i in range(2, len(calls)):
+            assert calls[i]["cached_prefix"] is not None, f"auto call {i} should use the cache"
+            assert calls[i]["cached_prefix_message_count"] == calls[i - 1]["n_messages"], (
+                f"auto call {i} must cache exactly the previous step's input"
+            )
+
+        # Caches are created covering a strictly growing prefix, one per auto turn.
+        assert [n for _, n in provider.created] == [
+            calls[1]["n_messages"],
+            calls[2]["n_messages"],
+            calls[3]["n_messages"],
+        ]
+        assert all(sid.startswith("reflect:") for sid, _ in provider.created)
+
+        # Ephemeral: the session is torn down exactly once when the reflect ends.
+        # Teardown is deliberately detached (the caller must not wait on deletes),
+        # so drain the background task before asserting it ran.
+        await asyncio.gather(*list(_cache_cleanup_tasks), return_exceptions=True)
+        assert len(provider.deleted_sessions) == 1
+        assert provider.deleted_sessions[0].startswith("reflect:")
+        assert provider.deleted_sessions[0] == provider.created[0][0]

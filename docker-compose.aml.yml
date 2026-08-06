@@ -1,0 +1,85 @@
+name: hindsight-aml
+
+services:
+  hindsight:
+    build:
+      context: .
+      dockerfile: docker/standalone/Dockerfile
+      target: api-only
+      args:
+        INCLUDE_API: "true"
+        INCLUDE_CP: "false"
+        INCLUDE_LOCAL_MODELS: "true"
+        PRELOAD_ML_MODELS: "true"
+    restart: unless-stopped
+    stop_grace_period: 45s
+    environment:
+      HINDSIGHT_API_LLM_PROVIDER: openai
+      HINDSIGHT_API_LLM_API_KEY: ${HINDSIGHT_API_LLM_API_KEY:?Set HINDSIGHT_API_LLM_API_KEY in .env}
+      HINDSIGHT_API_LLM_MODEL: gpt-4o-mini
+      HINDSIGHT_API_LLM_BASE_URL: ${HINDSIGHT_API_LLM_BASE_URL:-https://api.openai.com/v1}
+      HINDSIGHT_API_EMBEDDINGS_PROVIDER: local
+      HINDSIGHT_API_RERANKER_PROVIDER: local
+      HINDSIGHT_API_RETAIN_BATCH_ENABLED: "false"
+      HINDSIGHT_API_FAIL_ON_EXTRACTION_ERRORS: "true"
+      HINDSIGHT_API_DATABASE_URL: pg0://aml-hindsight
+      HINDSIGHT_API_HOST: 0.0.0.0
+      HINDSIGHT_API_PORT: "8888"
+    expose:
+      - "8888"
+    volumes:
+      - hindsight-data:/home/hindsight/.pg0
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import json, urllib.request;
+          response = urllib.request.urlopen('http://localhost:8888/health', timeout=5);
+          payload = json.load(response);
+          raise SystemExit(0 if response.status == 200 and payload.get('status') == 'healthy' and
+          payload.get('database') == 'connected' else 1)
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 30s
+
+  aml-api:
+    build:
+      context: .
+      dockerfile: aml_adapter/Dockerfile
+    restart: unless-stopped
+    stop_grace_period: 30s
+    depends_on:
+      hindsight:
+        condition: service_healthy
+    environment:
+      HINDSIGHT_BASE_URL: http://hindsight:8888
+      HINDSIGHT_TIMEOUT_SECONDS: ${HINDSIGHT_TIMEOUT_SECONDS:-600}
+      AML_IDEMPOTENCY_DB_PATH: /data/idempotency.sqlite3
+      AML_IDEMPOTENCY_WAIT_TIMEOUT_SECONDS: ${AML_IDEMPOTENCY_WAIT_TIMEOUT_SECONDS:-900}
+      AML_IDEMPOTENCY_LEASE_SECONDS: ${AML_IDEMPOTENCY_LEASE_SECONDS:-1200}
+      AML_IDEMPOTENCY_POLL_INTERVAL_SECONDS: ${AML_IDEMPOTENCY_POLL_INTERVAL_SECONDS:-0.1}
+    ports:
+      - "8000:8000"
+    volumes:
+      - aml-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import json, urllib.request;
+          response = urllib.request.urlopen('http://localhost:8000/health', timeout=5);
+          payload = json.load(response);
+          raise SystemExit(0 if response.status == 200 and payload.get('status') == 'healthy' else 1)
+      interval: 10s
+      timeout: 6s
+      retries: 6
+      start_period: 10s
+
+volumes:
+  hindsight-data:
+  aml-data:

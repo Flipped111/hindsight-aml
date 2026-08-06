@@ -1,0 +1,644 @@
+"""
+Pytest configuration and shared fixtures.
+"""
+
+import asyncio
+import os
+from pathlib import Path
+
+import filelock
+import pytest
+import pytest_asyncio
+from dotenv import load_dotenv
+
+# Force torch to initialize exactly once, in the main thread, at conftest import
+# time — before any fixture spins up an event loop or sentence-transformers'
+# thread pools. torch's C-level `_add_docstr(_has_torch_function, ...)` in
+# torch/overrides.py is not re-entrancy-safe: when the first `import torch`
+# happens lazily from inside concurrent/async code (e.g.
+# embeddings.initialize() -> sentence_transformers -> transformers -> torch, or
+# cross_encoder's ThreadPoolExecutor), torch/overrides.py can execute twice and
+# raise "RuntimeError: function '_has_torch_function' already has a docstring",
+# failing collection of every test on the pytest-xdist shard. Importing it here
+# (single-threaded, before any concurrency) makes that registration happen once
+# per worker process. Guarded so slim/no-torch environments still collect.
+try:
+    import torch  # noqa: F401  # eager one-time init; see comment above
+
+    # Same class of problem, different torch module. transformers' lazy loader
+    # imports `torch._inductor.test_operators` while resolving classes such as
+    # AutoModelForSequenceClassification / GenerationMixin (exercised by the
+    # cross-encoder / reranker tests). That module registers an `_inductor_test`
+    # TORCH_LIBRARY namespace at module-body level, and under pytest-xdist its
+    # body can execute twice, raising "Only a single TORCH_LIBRARY can be used
+    # to register the namespace _inductor_test". The failure surfaces on
+    # whichever shard runs the reranker tests, masked by transformers as a
+    # misleading "sentence-transformers is required for LocalSTEmbeddings"
+    # ImportError. Seed it once here so the later lazy import is a sys.modules
+    # cache hit and the body never re-executes.
+    import torch._inductor.test_operators  # noqa: F401  # see comment above
+
+    # Seed the rest of the native embedding/reranker stack the same way, and for
+    # the same reason. transformers and safetensors/tokenizers ship PyO3/Rust
+    # and C extensions whose module bodies are not safe to execute twice
+    # (safetensors raises "PyO3 modules ... may only be initialized once per
+    # interpreter process"). When these are first imported lazily from inside a
+    # fixture's event loop / sentence-transformers' thread pools, or re-executed
+    # by transformers' lazy-loader retry path, the second init aborts and — like
+    # the torch cases above — is re-raised as a misleading
+    # "sentence-transformers is required" ImportError on the reranker shard.
+    # Importing the whole chain here (single-threaded, at collection time) puts
+    # every submodule in sys.modules so later imports are cache hits.
+    import transformers  # noqa: F401  # seeds safetensors/tokenizers once
+    import sentence_transformers  # noqa: F401
+except ImportError:
+    pass
+
+from hindsight_api import LLMConfig, LocalSTEmbeddings, MemoryEngine, RequestContext
+from hindsight_api.engine.cross_encoder import LocalSTCrossEncoder
+from hindsight_api.engine.query_analyzer import DateparserQueryAnalyzer
+from hindsight_api.engine.task_backend import SyncTaskBackend
+from hindsight_api.pg0 import EmbeddedPostgres
+from hindsight_api.tracing import unregister_span_recorder
+
+
+async def _teardown_memory_engine(mem: MemoryEngine) -> None:
+    """Tear down a test MemoryEngine, guaranteeing its span recorder is unregistered.
+
+    LLM-trace recorders live in a process-global registry; ``MemoryEngine.close()`` is
+    the only thing that removes the engine's recorder from it. If close() is skipped
+    (pool already closing) or raises before that step, the recorder leaks and a later
+    test's LLM calls get recorded into the shared DB — the flaky
+    test_llm_trace::test_disabled_writes_no_rows (#2229). Unregister unconditionally;
+    it's a no-op when close() already did it.
+    """
+    try:
+        if mem._pool and not mem._pool._closing:
+            await mem.close()
+    except Exception:
+        pass
+    finally:
+        unregister_span_recorder(mem._llm_recorder)
+
+
+@pytest.fixture(autouse=True)
+def _cleanup_leaked_span_recorders():
+    """Fail-safe for the process-global LLM-trace recorder registry (#2229).
+
+    ``MemoryEngine.__init__`` registers its recorder in the shared registry, and
+    only ``close()`` removes it. Tests that construct an engine directly (without
+    ``_teardown_memory_engine``/``close()``) leak an *enabled* recorder; a later
+    test's LLM calls then get recorded into the shared DB, flaking
+    ``test_llm_trace::test_disabled_writes_no_rows`` (it observes rows for its
+    bank even though its own recorder is disabled). ``_teardown_memory_engine``
+    guards the fixtures; this guards everything else by dropping any recorder a
+    test added to the registry.
+    """
+    from hindsight_api.tracing import get_span_recorder
+
+    recorders = get_span_recorder()._recorders
+    before = {id(r) for r in recorders}
+    yield
+    for recorder in list(recorders):
+        if id(recorder) not in before:
+            recorders.remove(recorder)
+
+
+# Default pg0 instance configuration for tests
+DEFAULT_PG0_INSTANCE_NAME = "hindsight-test"
+DEFAULT_PG0_PORT = int(os.environ.get("HINDSIGHT_TEST_PG_PORT", "5556"))
+
+# Keep the background MaintenanceLoop from auto-starting during tests. In
+# production it sweeps retention and re-schedules consolidation, but its timers
+# would race shared-pg0 test data (e.g. delete llm_requests/audit_log rows a test
+# just inserted). Disabling the reconcile interval, the mental-model refresh tick
+# and llm-trace retention — with audit retention already off by default — leaves
+# no job enabled, so the loop never starts. Tests that exercise it call
+# MaintenanceLoop methods (_run_reconcile / _run_scheduled_mm_refresh /
+# _purge_expired) directly.
+os.environ.setdefault("HINDSIGHT_API_CONSOLIDATION_RECONCILE_INTERVAL_SECONDS", "0")
+os.environ.setdefault("HINDSIGHT_API_MENTAL_MODEL_REFRESH_TICK_SECONDS", "0")
+os.environ.setdefault("HINDSIGHT_API_LLM_TRACE_RETENTION_DAYS", "-1")
+
+
+# Load environment variables from .env at the start of test session
+def pytest_configure(config):
+    """Load environment variables before running tests."""
+    # Look for .env in the workspace root (two levels up from tests dir)
+    env_file = Path(__file__).parent.parent.parent / ".env"
+    if env_file.exists():
+        # override=True keeps the workspace .env authoritative for the test
+        # session, matching the precedence hindsight_api used to apply at import
+        # time (removed in #2961 so library imports are side-effect-free).
+        load_dotenv(env_file, override=True)
+    else:
+        print(f"Warning: {env_file} not found, tests may fail without proper configuration")
+
+
+@pytest.fixture(scope="session")
+def db_url():
+    """
+    Provide a PostgreSQL connection URL for tests.
+
+    If HINDSIGHT_API_DATABASE_URL is set, use it directly.
+    Otherwise, return None to indicate pg0 should be used (managed by pg0_instance fixture).
+    """
+    return os.getenv("HINDSIGHT_API_DATABASE_URL")
+
+
+@pytest.fixture(scope="session")
+def pg0_db_url(db_url, tmp_path_factory, worker_id):
+    """
+    Session-scoped fixture that ensures pg0 is running, migrations are applied,
+    and returns the database URL.
+
+    If HINDSIGHT_API_DATABASE_URL is a plain postgresql:// URL, uses it directly.
+    If HINDSIGHT_API_DATABASE_URL is a pg0:// URL, resolves it to a real URL first.
+    Otherwise, starts pg0 once for the entire test session.
+
+    Uses filelock to ensure only one pytest-xdist worker starts pg0.
+    Migrations use PostgreSQL advisory locks internally, so they're safe to call
+    from multiple workers - only one will actually run migrations.
+
+    Note: We don't stop pg0 at the end because pytest-xdist runs workers in separate
+    processes that share the same pg0 instance. pg0 will persist for the next test run.
+    """
+    from hindsight_api.pg0 import parse_pg0_url as _parse_pg0_url
+
+    # Determine pg0 instance name/port from db_url (if it's a pg0:// URL) or use defaults
+    if db_url and not _parse_pg0_url(db_url).is_pg0:
+        # Plain postgresql:// URL - use it directly but still run migrations
+        from hindsight_api.migrations import run_migrations
+
+        run_migrations(db_url)
+        return db_url
+
+    if db_url:
+        _parsed = _parse_pg0_url(db_url)
+        pg0_instance_name = _parsed.instance_name or DEFAULT_PG0_INSTANCE_NAME
+        pg0_instance_port = _parsed.port or DEFAULT_PG0_PORT
+    else:
+        pg0_instance_name = DEFAULT_PG0_INSTANCE_NAME
+        pg0_instance_port = DEFAULT_PG0_PORT
+
+    # Get shared temp dir for coordination between xdist workers
+    if worker_id == "master":
+        # Running without xdist (-n 0 or no -n flag)
+        root_tmp_dir = tmp_path_factory.getbasetemp()
+    else:
+        # Running with xdist - use parent dir shared by all workers
+        root_tmp_dir = tmp_path_factory.getbasetemp().parent
+
+    # Use a lock file to ensure only one worker starts pg0
+    lock_file = root_tmp_dir / f"pg0_setup_{pg0_instance_name}.lock"
+    url_file = root_tmp_dir / f"pg0_url_{pg0_instance_name}.txt"
+
+    with filelock.FileLock(str(lock_file)):
+        if url_file.exists():
+            # Another worker already started pg0
+            url = url_file.read_text().strip()
+        else:
+            # First worker - start pg0
+            # Bump max_connections so 8 xdist workers * pool_max_size=15 fits well
+            # under the cap (postgres default is 100, which is easy to exhaust now
+            # that consolidation_llm_parallelism=4 increases peak conns per op).
+            pg0 = EmbeddedPostgres(
+                name=pg0_instance_name,
+                port=pg0_instance_port,
+                config={"max_connections": "300"},
+            )
+
+            # Run ensure_running in a new event loop
+            loop = asyncio.new_event_loop()
+            try:
+                url = loop.run_until_complete(pg0.ensure_running())
+            finally:
+                loop.close()
+
+            # Save URL for other workers
+            url_file.write_text(url)
+
+    # Run migrations - uses PostgreSQL advisory lock internally,
+    # so safe to call from multiple workers (only one will actually run migrations)
+    from hindsight_api.migrations import run_migrations
+
+    run_migrations(url)
+
+    # Clean up stale test data from previous sessions. Per-bank vector indexes
+    # accumulate across runs (each test bank creates 3 HNSW indexes) and
+    # eventually exhaust pg0's shared memory / max_locks_per_transaction.
+    # Only one xdist worker needs to do this.
+    cleanup_lock = root_tmp_dir / f"pg0_cleanup_{pg0_instance_name}.lock"
+    cleanup_done = root_tmp_dir / f"pg0_cleanup_{pg0_instance_name}.done"
+    with filelock.FileLock(str(cleanup_lock)):
+        if not cleanup_done.exists():
+            _cleanup_stale_test_data(url)
+            cleanup_done.write_text("done")
+
+    return url
+
+
+def _cleanup_stale_test_data(db_url: str) -> None:
+    """Drop all per-bank vector indexes and test data from previous sessions.
+
+    pg0 persists between test runs, so per-bank HNSW indexes accumulate
+    (3 per bank × thousands of test banks = tens of thousands of indexes).
+    This eventually causes 'out of shared memory' errors because PostgreSQL
+    tracks all indexes in shared lock tables.
+    """
+    import asyncpg
+
+    async def _do_cleanup():
+        conn = await asyncpg.connect(db_url)
+        try:
+            idx_rows = await conn.fetch(
+                "SELECT indexname FROM pg_indexes WHERE schemaname = 'public' AND indexname LIKE 'idx_mu_emb_%'"
+            )
+            if idx_rows:
+                for row in idx_rows:
+                    await conn.execute(f'DROP INDEX IF EXISTS public."{row["indexname"]}"')
+
+            # Truncate test data in dependency order
+            for table in [
+                "entity_cooccurrences",
+                "unit_entities",
+                "memory_links",
+                "entities",
+                "memory_units",
+                "chunks",
+                "documents",
+                "mental_models",
+                "directives",
+                "async_operations",
+                "audit_log",
+                "webhooks",
+                "file_storage",
+                "banks",
+            ]:
+                try:
+                    await conn.execute(f"TRUNCATE {table} CASCADE")
+                except Exception:
+                    pass  # Table may not exist yet
+        finally:
+            await conn.close()
+
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(_do_cleanup())
+    finally:
+        loop.close()
+
+
+@pytest.fixture(scope="session")
+def _oracle_admin_dsn():
+    """
+    Parse ORACLE_TEST_DSN into admin connection parameters.
+
+    Accepts either URL format (oracle://user:pass@host:port/service) or
+    bare DSN (host:port/service) with separate ORACLE_TEST_USER/PASSWORD env vars.
+    Skips the entire test session if ORACLE_TEST_DSN is not set.
+    """
+    from urllib.parse import urlparse
+
+    dsn = os.getenv("ORACLE_TEST_DSN")
+    if not dsn:
+        pytest.skip("ORACLE_TEST_DSN not set — skipping Oracle tests")
+
+    parsed = urlparse(dsn)
+    if parsed.scheme in ("oracle", "oracle+oracledb"):
+        host = parsed.hostname or "localhost"
+        port = parsed.port or 1521
+        service = parsed.path.lstrip("/") if parsed.path else "FREEPDB1"
+        return {
+            "user": parsed.username or "SYSTEM",
+            "password": parsed.password or "oracle",
+            "dsn": f"{host}:{port}/{service}",
+        }
+    else:
+        return {
+            "user": os.getenv("ORACLE_TEST_USER", "SYSTEM"),
+            "password": os.getenv("ORACLE_TEST_PASSWORD", "oracle"),
+            "dsn": dsn,
+        }
+
+
+@pytest.fixture(scope="session")
+def oracle_db_url(_oracle_admin_dsn):
+    """
+    Bootstrap a dedicated Oracle test user with an ASSM tablespace and return
+    a connection URL for that user.
+
+    Oracle 23ai requires VECTOR columns to be in an Automatic Segment Space
+    Management (ASSM) tablespace. The default SYSTEM tablespace is not ASSM,
+    so connecting as SYSTEM directly would cause ORA-43853 during migrations.
+
+    This fixture creates a ``HINDSIGHT_TEST`` user (idempotent) with the USERS
+    tablespace (which is ASSM on Oracle Free/XE) and returns a URL that the
+    ``oracle_memory`` fixture and ``run_migrations()`` can use directly.
+    """
+    try:
+        import oracledb
+    except ImportError:
+        pytest.skip("oracledb not installed — skipping Oracle tests")
+
+    oracledb.defaults.fetch_lobs = False
+
+    admin_user = _oracle_admin_dsn["user"]
+    admin_pass = _oracle_admin_dsn["password"]
+    bare_dsn = _oracle_admin_dsn["dsn"]
+
+    test_user = "HINDSIGHT_TEST"
+    test_pass = "hindsight_test"
+
+    conn = oracledb.connect(user=admin_user, password=admin_pass, dsn=bare_dsn)
+    cursor = conn.cursor()
+    try:
+        # Create test user (idempotent — skip if already exists)
+        try:
+            cursor.execute(
+                f'CREATE USER {test_user} IDENTIFIED BY "{test_pass}" DEFAULT TABLESPACE USERS QUOTA UNLIMITED ON USERS'
+            )
+        except oracledb.DatabaseError as e:
+            if hasattr(e.args[0], "code") and e.args[0].code == 1920:
+                # ORA-01920: user name conflicts with another user or role name
+                pass
+            else:
+                raise
+
+        # Grant required privileges (idempotent)
+        for grant in [
+            f"GRANT CONNECT, RESOURCE, UNLIMITED TABLESPACE TO {test_user}",
+            f"GRANT CREATE SESSION, CREATE TABLE, CREATE SEQUENCE, CREATE VIEW TO {test_user}",
+            f"GRANT CTXAPP TO {test_user}",
+        ]:
+            try:
+                cursor.execute(grant)
+            except oracledb.DatabaseError:
+                pass
+
+        # Grant UTL_MATCH for fuzzy entity matching (may not be available)
+        try:
+            cursor.execute(f"GRANT EXECUTE ON UTL_MATCH TO {test_user}")
+        except oracledb.DatabaseError:
+            pass
+
+        conn.commit()
+    finally:
+        cursor.close()
+        conn.close()
+
+    # Return URL-format DSN for the test user
+    url = f"oracle://{test_user}:{test_pass}@{bare_dsn}"
+
+    # Run idempotent migrations once at session scope (mirrors PG's pg0_db_url).
+    # This avoids re-running DDL checks on every function-scoped test.
+    from hindsight_api.migrations import run_migrations
+
+    run_migrations(url)
+
+    return url
+
+
+@pytest_asyncio.fixture(scope="function")
+async def oracle_memory(oracle_db_url, embeddings, cross_encoder, query_analyzer):
+    """
+    Provide a MemoryEngine backed by Oracle 23ai for each test.
+
+    Mirrors the PG `memory` fixture but uses the Oracle backend.
+    Migrations are run once at session scope in the `oracle_db_url` fixture.
+    """
+    from hindsight_api.config import clear_config_cache
+
+    # Temporarily set the database backend env var so the global config
+    # (used by fq_table / _is_oracle) returns "oracle".
+    old_backend = os.environ.get("HINDSIGHT_API_DATABASE_BACKEND")
+    os.environ["HINDSIGHT_API_DATABASE_BACKEND"] = "oracle"
+    clear_config_cache()
+
+    try:
+        mem = MemoryEngine(
+            db_url=oracle_db_url,
+            # Note: conftest loads ../.env with override=True at session start, so
+            # these defaults only apply if no .env file is found. .env is authoritative.
+            memory_llm_provider=os.getenv("HINDSIGHT_API_LLM_PROVIDER", "openai"),
+            memory_llm_api_key=os.getenv("HINDSIGHT_API_LLM_API_KEY"),
+            memory_llm_model=os.getenv("HINDSIGHT_API_LLM_MODEL", "gpt-4o-mini"),
+            memory_llm_base_url=os.getenv("HINDSIGHT_API_LLM_BASE_URL") or None,
+            embeddings=embeddings,
+            cross_encoder=cross_encoder,
+            query_analyzer=query_analyzer,
+            pool_min_size=1,
+            pool_max_size=15,
+            run_migrations=False,  # Already ran above
+            task_backend=SyncTaskBackend(),
+        )
+        await mem.initialize()
+        yield mem
+        await _teardown_memory_engine(mem)
+    finally:
+        # Restore original env var and clear config cache
+        if old_backend is None:
+            os.environ.pop("HINDSIGHT_API_DATABASE_BACKEND", None)
+        else:
+            os.environ["HINDSIGHT_API_DATABASE_BACKEND"] = old_backend
+        clear_config_cache()
+
+
+@pytest.fixture(scope="function")
+def request_context():
+    """Provide a default RequestContext for tests."""
+    return RequestContext()
+
+
+@pytest.fixture(scope="session")
+def llm_config():
+    """
+    Provide LLM configuration for tests.
+    This can be used by tests that need to call LLM directly without memory system.
+    """
+    return LLMConfig.from_env()
+
+
+@pytest.fixture(scope="session")
+def embeddings(tmp_path_factory, worker_id):
+    """
+    Session-scoped embeddings fixture with filelock to prevent race conditions.
+
+    When pytest-xdist runs multiple workers in parallel, they all try to load
+    models from the HuggingFace cache simultaneously, which can cause race
+    conditions and meta tensor errors. We use a filelock to serialize model
+    initialization across workers.
+    """
+    # Get shared temp dir for coordination between xdist workers
+    if worker_id == "master":
+        root_tmp_dir = tmp_path_factory.getbasetemp()
+    else:
+        root_tmp_dir = tmp_path_factory.getbasetemp().parent
+
+    lock_file = root_tmp_dir / "embeddings_init.lock"
+
+    emb = LocalSTEmbeddings()
+
+    # Serialize model initialization across workers
+    with filelock.FileLock(str(lock_file)):
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(emb.initialize())
+        finally:
+            loop.close()
+
+    return emb
+
+
+@pytest.fixture(scope="session")
+def cross_encoder(tmp_path_factory, worker_id):
+    """
+    Session-scoped cross-encoder fixture with filelock to prevent race conditions.
+
+    When pytest-xdist runs multiple workers in parallel, they all try to load
+    models from the HuggingFace cache simultaneously, which can cause race
+    conditions and meta tensor errors. We use a filelock to serialize model
+    initialization across workers.
+    """
+    # Get shared temp dir for coordination between xdist workers
+    if worker_id == "master":
+        root_tmp_dir = tmp_path_factory.getbasetemp()
+    else:
+        root_tmp_dir = tmp_path_factory.getbasetemp().parent
+
+    lock_file = root_tmp_dir / "cross_encoder_init.lock"
+
+    ce = LocalSTCrossEncoder()
+
+    # Serialize model initialization across workers
+    with filelock.FileLock(str(lock_file)):
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(ce.initialize())
+        finally:
+            loop.close()
+
+    return ce
+
+
+@pytest.fixture(scope="session")
+def query_analyzer():
+    return DateparserQueryAnalyzer()
+
+
+@pytest_asyncio.fixture(scope="function")
+async def memory(pg0_db_url, embeddings, cross_encoder, query_analyzer):
+    """
+    Provide a MemoryEngine instance using a mock LLM for deterministic tests.
+
+    The mock LLM returns canned facts derived from input text, allowing the
+    full retain → recall → reflect pipeline to work without real LLM calls.
+    This makes core tests fast, deterministic, and free from LLM flakiness.
+
+    Tests that need real LLM output quality should use `memory_real_llm` instead.
+    """
+    mem = MemoryEngine(
+        db_url=pg0_db_url,
+        memory_llm_provider="mock",
+        memory_llm_api_key="",
+        memory_llm_model="mock",
+        embeddings=embeddings,
+        cross_encoder=cross_encoder,
+        query_analyzer=query_analyzer,
+        pool_min_size=1,
+        pool_max_size=15,
+        run_migrations=False,
+        task_backend=SyncTaskBackend(),
+    )
+    await mem.initialize()
+    yield mem
+    await _teardown_memory_engine(mem)
+
+
+@pytest_asyncio.fixture(scope="function")
+async def memory_real_llm(pg0_db_url, embeddings, cross_encoder, query_analyzer):
+    """
+    Provide a MemoryEngine instance using a real LLM provider.
+
+    Use this fixture ONLY for tests that assert on LLM output quality
+    (fact extraction accuracy, language preservation, consolidation decisions, etc.).
+    These tests are non-deterministic and should be marked with @pytest.mark.hs_llm_core
+    (or @pytest.mark.hs_llm_mat for provider matrix acceptance tests).
+    """
+    mem = MemoryEngine(
+        db_url=pg0_db_url,
+        memory_llm_provider=os.getenv("HINDSIGHT_API_LLM_PROVIDER", "groq"),
+        memory_llm_api_key=os.getenv("HINDSIGHT_API_LLM_API_KEY"),
+        memory_llm_model=os.getenv("HINDSIGHT_API_LLM_MODEL", "openai/gpt-oss-120b"),
+        memory_llm_base_url=os.getenv("HINDSIGHT_API_LLM_BASE_URL") or None,
+        embeddings=embeddings,
+        cross_encoder=cross_encoder,
+        query_analyzer=query_analyzer,
+        pool_min_size=1,
+        pool_max_size=15,
+        run_migrations=False,
+        task_backend=SyncTaskBackend(),
+    )
+    await mem.initialize()
+    yield mem
+    await _teardown_memory_engine(mem)
+
+
+@pytest_asyncio.fixture(scope="function")
+async def memory_no_llm_verify(pg0_db_url, embeddings, cross_encoder, query_analyzer):
+    """
+    Provide a MemoryEngine instance that skips LLM connection verification.
+
+    This fixture is useful for tests that override the LLM configuration
+    after initialization (e.g., to test specific providers).
+    """
+    mem = MemoryEngine(
+        db_url=pg0_db_url,
+        memory_llm_provider="mock",  # Use mock provider as placeholder
+        memory_llm_api_key="",
+        memory_llm_model="mock",
+        embeddings=embeddings,
+        cross_encoder=cross_encoder,
+        query_analyzer=query_analyzer,
+        pool_min_size=1,
+        pool_max_size=15,
+        run_migrations=False,
+        task_backend=SyncTaskBackend(),
+        skip_llm_verification=True,  # Skip verification - will be overridden by test
+    )
+    await mem.initialize()
+    yield mem
+    await _teardown_memory_engine(mem)
+
+
+@pytest_asyncio.fixture
+async def api_client(memory):
+    """General-purpose HTTP test client over the `memory` fixture's app.
+
+    Use for any integration test that exercises the FastAPI surface without
+    needing audit-logging side effects. See `audit_api_client` for the
+    audit-enabled variant.
+    """
+    import httpx
+
+    from hindsight_api.api import create_app
+
+    app = create_app(memory, initialize_memory=False)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        yield client
+
+
+def enable_audit_default(memory, enabled: bool) -> None:
+    """Set the deployment-wide default for the hierarchical ``audit_log_enabled``.
+
+    ``audit_log_enabled`` resolves through env -> tenant -> bank, and the
+    ConfigResolver snapshots the global layer at construction time. Tests that
+    want "auditing on by default" therefore have to update that snapshot;
+    flipping ``AuditLogger._enabled`` alone only covers actions with no bank in
+    scope. Per-bank overrides are set with ``resolver.update_bank_config``.
+    """
+    from dataclasses import replace
+
+    resolver = memory._config_resolver
+    resolver._global_config = replace(resolver._global_config, audit_log_enabled=enabled)
