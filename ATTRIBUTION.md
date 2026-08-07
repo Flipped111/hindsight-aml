@@ -11,6 +11,11 @@ Vectorize AI, Inc. and its contributors.
 - License: MIT; the complete license text is preserved in [LICENSE](./LICENSE)
 - Technical report: [Hindsight: Agent Memory That Works Like Human Memory](https://arxiv.org/abs/2512.12818)
 
+## Submission release
+
+- Repository: [Flipped111/hindsight-aml](https://github.com/Flipped111/hindsight-aml)
+- Release tag: `aml-v0.1.0`
+
 The upstream Hindsight implementation, generated clients, documentation, and existing notices remain under their
 original terms. No claim is made that the AML adapter is part of or endorsed by the upstream project.
 

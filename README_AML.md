@@ -11,6 +11,8 @@ AML GET  /health -> AML adapter + Hindsight dependency health
 
 ## Fixed baseline
 
+- Submission repository: [Flipped111/hindsight-aml](https://github.com/Flipped111/hindsight-aml)
+- Submission tag: `aml-v0.1.0`
 - Upstream project: [vectorize-io/hindsight](https://github.com/vectorize-io/hindsight)
 - Hindsight version: `0.8.6`
 - Upstream baseline commit: `436bc7c156f1c94714ea1f757bfc930ab89f883b`
