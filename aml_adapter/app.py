@@ -85,7 +85,7 @@ def create_app(service: MemoryService | None = None) -> FastAPI:
         finally:
             await memory_service.close()
 
-    app = FastAPI(title="Hindsight AML Adapter", version="0.2.1", lifespan=lifespan)
+    app = FastAPI(title="Hindsight AML Adapter", version="0.3.0", lifespan=lifespan)
 
     @app.exception_handler(BusinessError)
     async def business_error_handler(_: Request, error: BusinessError) -> JSONResponse:

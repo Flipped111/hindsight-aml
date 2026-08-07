@@ -9,6 +9,8 @@ from enum import StrEnum
 from pathlib import Path
 from uuid import uuid4
 
+from aml_adapter.raw_retrieval import RawMessageDocument, RawMessageHit, rank_raw_messages
+
 
 class RequestConflictError(Exception):
     """A request ID was reused with different immutable request data."""
@@ -38,6 +40,19 @@ class ClaimResult:
     owner_token: str | None = None
 
 
+@dataclass(frozen=True)
+class RawMessageWrite:
+    document_id: str
+    request_id: str
+    message_index: int
+    user_scope: str
+    session_id: str
+    role: str
+    content: str
+    search_text: str
+    timestamp_ms: int | None
+
+
 class IdempotencyStore:
     def __init__(self, path: Path, lease_seconds: float) -> None:
         self._path = path
@@ -61,6 +76,17 @@ class IdempotencyStore:
     async def release(self, request_id: str, owner_token: str) -> None:
         await asyncio.to_thread(self._release_sync, request_id, owner_token)
 
+    async def stage_raw_messages(
+        self,
+        request_id: str,
+        owner_token: str,
+        messages: list[RawMessageWrite],
+    ) -> None:
+        await asyncio.to_thread(self._stage_raw_messages_sync, request_id, owner_token, messages)
+
+    async def search_raw_messages(self, user_scope: str, query: str, limit: int) -> list[RawMessageHit]:
+        return await asyncio.to_thread(self._search_raw_messages_sync, user_scope, query, limit)
+
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self._path, timeout=30, isolation_level=None)
         connection.row_factory = sqlite3.Row
@@ -83,6 +109,29 @@ class IdempotencyStore:
                     owner_token TEXT,
                     processing_started_at REAL
                 )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS raw_messages (
+                    document_id TEXT PRIMARY KEY,
+                    request_id TEXT NOT NULL,
+                    message_index INTEGER NOT NULL,
+                    user_scope TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    search_text TEXT NOT NULL,
+                    timestamp_ms INTEGER,
+                    status TEXT NOT NULL CHECK (status IN ('pending', 'active')),
+                    UNIQUE(request_id, message_index)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS raw_messages_user_status
+                ON raw_messages(user_scope, status)
                 """
             )
 
@@ -162,7 +211,9 @@ class IdempotencyStore:
 
     def _complete_sync(self, request_id: str, owner_token: str) -> None:
         completed_at = datetime.now(tz=UTC).isoformat().replace("+00:00", "Z")
-        with self._connect() as connection:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
             cursor = connection.execute(
                 """
                 UPDATE processed_requests
@@ -174,13 +225,123 @@ class IdempotencyStore:
             )
             if cursor.rowcount != 1:
                 raise LeaseLostError(f"claim for request_id '{request_id}' is no longer owned")
+            connection.execute(
+                """
+                UPDATE raw_messages
+                SET status = 'active'
+                WHERE request_id = ? AND status = 'pending'
+                """,
+                (request_id,),
+            )
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def _release_sync(self, request_id: str, owner_token: str) -> None:
-        with self._connect() as connection:
-            connection.execute(
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
                 """
                 DELETE FROM processed_requests
                 WHERE request_id = ? AND status = 'processing' AND owner_token = ?
                 """,
                 (request_id, owner_token),
             )
+            if cursor.rowcount == 1:
+                connection.execute(
+                    """
+                    DELETE FROM raw_messages
+                    WHERE request_id = ? AND status = 'pending'
+                    """,
+                    (request_id,),
+                )
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def _stage_raw_messages_sync(
+        self,
+        request_id: str,
+        owner_token: str,
+        messages: list[RawMessageWrite],
+    ) -> None:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            owner = connection.execute(
+                """
+                SELECT 1
+                FROM processed_requests
+                WHERE request_id = ? AND status = 'processing' AND owner_token = ?
+                """,
+                (request_id, owner_token),
+            ).fetchone()
+            if owner is None:
+                raise LeaseLostError(f"claim for request_id '{request_id}' is no longer owned")
+
+            for message in messages:
+                connection.execute(
+                    """
+                    INSERT INTO raw_messages (
+                        document_id, request_id, message_index, user_scope, session_id,
+                        role, content, search_text, timestamp_ms, status
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+                    ON CONFLICT(document_id) DO UPDATE SET
+                        request_id = excluded.request_id,
+                        message_index = excluded.message_index,
+                        user_scope = excluded.user_scope,
+                        session_id = excluded.session_id,
+                        role = excluded.role,
+                        content = excluded.content,
+                        search_text = excluded.search_text,
+                        timestamp_ms = excluded.timestamp_ms,
+                        status = 'pending'
+                    """,
+                    (
+                        message.document_id,
+                        message.request_id,
+                        message.message_index,
+                        message.user_scope,
+                        message.session_id,
+                        message.role,
+                        message.content,
+                        message.search_text,
+                        message.timestamp_ms,
+                    ),
+                )
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def _search_raw_messages_sync(self, user_scope: str, query: str, limit: int) -> list[RawMessageHit]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT document_id, content, search_text, session_id, role, timestamp_ms
+                FROM raw_messages
+                WHERE user_scope = ? AND status = 'active'
+                """,
+                (user_scope,),
+            ).fetchall()
+        documents = [
+            RawMessageDocument(
+                document_id=row["document_id"],
+                content=row["content"],
+                session_id=row["session_id"],
+                role=row["role"],
+                timestamp_ms=row["timestamp_ms"],
+                search_text=row["search_text"],
+            )
+            for row in rows
+        ]
+        return rank_raw_messages(query, documents, limit)

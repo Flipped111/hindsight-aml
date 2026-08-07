@@ -1,4 +1,4 @@
-name: hindsight-aml
+name: hindsight-aml-v030
 
 services:
   hindsight:

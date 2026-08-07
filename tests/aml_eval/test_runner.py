@@ -1,19 +1,20 @@
 from __future__ import annotations
 
-from pathlib import Path
 import json
+from pathlib import Path
 
 import httpx
 import pytest
 
 from aml_adapter.schemas import AddRequest, AddResponse, Message, SearchResponse, SearchResult
 from tools.aml_eval import (
-    AmlClientProtocol,
     AmlClient,
+    AmlClientProtocol,
     EndpointOutcome,
     EvaluationCase,
     EvaluationManifest,
     EvaluationQuery,
+    SearchMetric,
     load_manifest,
     run_manifest,
 )
@@ -51,10 +52,12 @@ def build_manifest() -> EvaluationManifest:
                 searches=[
                     EvaluationQuery(
                         query_id="query-1",
+                        category="temporal",
                         query="Where do I live?",
                         user_id="user-1",
                         top_k=5,
                         expected_terms=["Tokyo"],
+                        expected_evidence_terms=["User lives in Tokyo."],
                     )
                 ],
             )
@@ -93,7 +96,12 @@ async def test_run_manifest_records_latency_and_evidence_metrics() -> None:
     assert report.aggregate.hit_at_1 == 0
     assert report.aggregate.hit_at_5 == 1
     assert report.aggregate.mrr == 0.5
+    assert report.aggregate.evidence_hit_at_5 == 1
+    assert report.aggregate.evidence_mrr == 0.5
+    assert report.by_category["temporal"].searches == 1
+    assert report.by_category["temporal"].mrr == 0.5
     assert report.cases[0].searches[0].all_expected_terms_found is True
+    assert report.cases[0].searches[0].all_expected_evidence_terms_found is True
     assert [request.request_id for request in client.add_requests] == ["add-1"]
     assert [request.query_id for request in client.search_requests] == ["query-1"]
 
@@ -114,6 +122,27 @@ async def test_failed_add_skips_search_and_marks_report_failed() -> None:
 
 
 @pytest.mark.asyncio
+async def test_run_manifest_can_skip_adds_for_shared_memory_comparison() -> None:
+    client: AmlClientProtocol = FakeAmlClient(
+        add_outcomes=[],
+        search_outcomes=[
+            EndpointOutcome(
+                status_code=200,
+                elapsed_ms=10,
+                payload=SearchResponse(data=[SearchResult(id="tokyo", content="User lives in Tokyo.")]),
+            )
+        ],
+    )
+
+    report = await run_manifest(build_manifest(), client, skip_adds=True)
+
+    assert report.aggregate.add_requests == 0
+    assert report.aggregate.search_success_rate == 1
+    assert report.aggregate.hit_at_1 == 1
+    assert client.add_requests == []
+
+
+@pytest.mark.asyncio
 async def test_http_client_sends_only_official_search_fields() -> None:
     captured_body: list[object] = []
 
@@ -123,10 +152,12 @@ async def test_http_client_sends_only_official_search_fields() -> None:
 
     query = EvaluationQuery(
         query_id="internal-query-id",
+        category="temporal",
         query="Where do I live?",
         user_id="user-1",
         top_k=5,
         expected_terms=["Tokyo"],
+        expected_evidence_terms=["User lives in Tokyo."],
     )
     async with AmlClient("http://test", timeout_seconds=5, transport=httpx.MockTransport(handler)) as client:
         outcome = await client.search(query)
@@ -179,3 +210,22 @@ def test_load_manifest_accepts_optional_timestamp_and_options(tmp_path: Path) ->
     assert manifest.cases[0].adds[0].messages[0].timestamp is None
     assert manifest.cases[0].searches[0].options == []
     assert manifest.cases[0].searches[0].expected_terms == []
+
+
+def test_search_metric_matches_human_date_against_iso_evidence() -> None:
+    query = EvaluationQuery(
+        query_id="date-query",
+        query="When did the event happen?",
+        user_id="user-1",
+        top_k=5,
+        expected_terms=["7 May 2023"],
+    )
+    outcome = EndpointOutcome(
+        status_code=200,
+        elapsed_ms=10,
+        payload=SearchResponse(data=[SearchResult(id="date", content="When: 2023-05-07")]),
+    )
+
+    metric = SearchMetric.from_outcome(query, outcome)
+
+    assert metric.first_hit_rank == 1

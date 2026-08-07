@@ -4,13 +4,15 @@ import asyncio
 import hashlib
 import json
 import time
-from dataclasses import dataclass
+import unicodedata
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any, Literal, Protocol
 
 from hindsight_client import Hindsight
 from pydantic import BaseModel
 
+from aml_adapter.raw_retrieval import RawMessageHit
 from aml_adapter.schemas import (
     AddRequest,
     AddResponse,
@@ -20,7 +22,22 @@ from aml_adapter.schemas import (
     SearchResponse,
     SearchResult,
 )
-from aml_adapter.storage import ClaimStatus, IdempotencyStore, LeaseLostError, RequestIdentity
+from aml_adapter.storage import (
+    ClaimStatus,
+    IdempotencyStore,
+    LeaseLostError,
+    RawMessageWrite,
+    RequestIdentity,
+)
+from aml_adapter.temporal_reranking import temporal_score_multipliers
+
+_RRF_K = 60
+_FACT_RRF_WEIGHT = 1.0
+_RAW_RRF_WEIGHT = 0.95
+_WEAK_RAW_RRF_WEIGHT = 0.55
+_WEAK_RAW_SCORE_MAX = 1e-5
+_MAX_PRIMARY_RAW_RESULTS = 4
+_MAX_RESULTS_PER_DOCUMENT = 2
 
 
 class MemoryDependencyError(Exception):
@@ -82,6 +99,7 @@ class HindsightGateway:
                     text=result.text,
                     score=score,
                     mentioned_at=result.mentioned_at,
+                    document_id=getattr(result, "document_id", None),
                 )
             )
         return evidence
@@ -150,15 +168,24 @@ class MemoryService:
             await asyncio.sleep(self._policy.poll_interval_seconds)
 
     async def search(self, request: SearchRequest) -> SearchResponse:
-        evidence = await self._gateway.recall(user_to_bank_id(request.user_id), request.query)
-        results = [_to_search_result(item) for item in evidence]
-        valid_results = [item for item in results if item is not None]
-        valid_results.sort(key=lambda item: item.score if item.score is not None else float("-inf"), reverse=True)
-        return SearchResponse(data=valid_results[: request.top_k])
+        user_scope = user_to_bank_id(request.user_id)
+        raw_limit = min(200, max(40, request.top_k * 2))
+        evidence, raw_hits = await asyncio.gather(
+            self._gateway.recall(user_scope, request.query),
+            self._store.search_raw_messages(user_scope, request.query, raw_limit),
+        )
+        return SearchResponse(data=_merge_search_results(request.query, evidence, raw_hits, request.top_k))
 
     async def _retain_claimed(self, request: AddRequest, owner_token: str) -> AddResponse:
         try:
-            await self._gateway.retain(user_to_bank_id(request.user_id), _retain_items(request))
+            user_scope = user_to_bank_id(request.user_id)
+            retain_items = _retain_items(request)
+            await self._store.stage_raw_messages(
+                request.request_id,
+                owner_token,
+                _raw_message_writes(request, user_scope, retain_items),
+            )
+            await self._gateway.retain(user_scope, retain_items)
             await self._store.complete(request.request_id, owner_token)
         except LeaseLostError as exc:
             raise MemoryDependencyError("idempotency claim expired during retain") from exc
@@ -215,6 +242,135 @@ def _retain_items(request: AddRequest) -> list[RetainItem]:
     return items
 
 
+def _raw_message_writes(
+    request: AddRequest,
+    user_scope: str,
+    retain_items: list[RetainItem],
+) -> list[RawMessageWrite]:
+    return [
+        RawMessageWrite(
+            document_id=item.document_id,
+            request_id=request.request_id,
+            message_index=index,
+            user_scope=user_scope,
+            session_id=request.session_id,
+            role=request.messages[index].role,
+            content=item.content,
+            search_text=request.messages[index].content,
+            timestamp_ms=request.messages[index].timestamp,
+        )
+        for index, item in enumerate(retain_items)
+    ]
+
+
+@dataclass(frozen=True)
+class _FusionCandidate:
+    result: SearchResult
+    source: Literal["fact", "raw"]
+    source_rank: int
+    document_id: str | None
+    event_time: datetime | None
+    fused_score: float
+
+
+def _merge_search_results(
+    query: str,
+    evidence: list[MemoryEvidence],
+    raw_hits: list[RawMessageHit],
+    top_k: int,
+) -> list[SearchResult]:
+    candidates: list[_FusionCandidate] = []
+    fact_results = [(item, result) for item in evidence if (result := _to_search_result(item)) is not None]
+    fact_results.sort(
+        key=lambda pair: pair[0].score if pair[0].score is not None else float("-inf"),
+        reverse=True,
+    )
+    for rank, (item, result) in enumerate(fact_results, start=1):
+        fused_score = _FACT_RRF_WEIGHT / (_RRF_K + rank)
+        candidates.append(
+            _FusionCandidate(
+                result=result.model_copy(update={"score": fused_score}),
+                source="fact",
+                source_rank=rank,
+                document_id=item.document_id,
+                event_time=_parse_reliable_utc_timestamp(item.mentioned_at),
+                fused_score=fused_score,
+            )
+        )
+
+    for rank, item in enumerate(raw_hits, start=1):
+        source_weight = _WEAK_RAW_RRF_WEIGHT if item.lexical_score <= _WEAK_RAW_SCORE_MAX else _RAW_RRF_WEIGHT
+        result = SearchResult(
+            id=f"raw:{item.document_id}",
+            content=item.content,
+            score=source_weight / (_RRF_K + rank),
+            created_at=_timestamp_ms_to_utc(item.timestamp_ms),
+        )
+        candidates.append(
+            _FusionCandidate(
+                result=result,
+                source="raw",
+                source_rank=rank,
+                document_id=item.document_id,
+                event_time=_timestamp_ms_to_datetime(item.timestamp_ms),
+                fused_score=result.score or 0.0,
+            )
+        )
+
+    temporal_multipliers = temporal_score_multipliers(query, [item.event_time for item in candidates])
+    candidates = [
+        replace(
+            item,
+            result=item.result.model_copy(update={"score": item.fused_score * multiplier}),
+            fused_score=item.fused_score * multiplier,
+        )
+        for item, multiplier in zip(candidates, temporal_multipliers, strict=True)
+    ]
+
+    candidates.sort(
+        key=lambda item: (
+            -item.fused_score,
+            0 if item.source == "fact" else 1,
+            item.source_rank,
+            item.result.id,
+        )
+    )
+    selected: list[SearchResult] = []
+    deferred_raw: list[_FusionCandidate] = []
+    seen_content: set[str] = set()
+    document_counts: dict[str, int] = {}
+    raw_results = 0
+
+    def select(candidate: _FusionCandidate) -> bool:
+        nonlocal raw_results
+        normalized_content = _normalize_evidence_text(candidate.result.content)
+        if normalized_content in seen_content:
+            return False
+        if candidate.document_id is not None:
+            count = document_counts.get(candidate.document_id, 0)
+            if count >= _MAX_RESULTS_PER_DOCUMENT:
+                return False
+            document_counts[candidate.document_id] = count + 1
+        seen_content.add(normalized_content)
+        selected.append(candidate.result)
+        if candidate.source == "raw":
+            raw_results += 1
+        return True
+
+    for candidate in candidates:
+        if candidate.source == "raw" and raw_results >= _MAX_PRIMARY_RAW_RESULTS:
+            deferred_raw.append(candidate)
+            continue
+        if select(candidate) and len(selected) >= top_k:
+            break
+
+    if len(selected) < top_k:
+        for candidate in deferred_raw:
+            if select(candidate) and len(selected) >= top_k:
+                break
+    return selected
+
+
 def _to_search_result(evidence: MemoryEvidence) -> SearchResult | None:
     if not evidence.id.strip() or not evidence.text.strip():
         return None
@@ -227,6 +383,11 @@ def _to_search_result(evidence: MemoryEvidence) -> SearchResult | None:
 
 
 def _reliable_utc_timestamp(value: str | None) -> str | None:
+    parsed = _parse_reliable_utc_timestamp(value)
+    return parsed.isoformat().replace("+00:00", "Z") if parsed is not None else None
+
+
+def _parse_reliable_utc_timestamp(value: str | None) -> datetime | None:
     if value is None:
         return None
     try:
@@ -235,7 +396,26 @@ def _reliable_utc_timestamp(value: str | None) -> str | None:
         return None
     if parsed.tzinfo is None:
         return None
-    return parsed.astimezone(UTC).isoformat().replace("+00:00", "Z")
+    return parsed.astimezone(UTC)
+
+
+def _timestamp_ms_to_utc(value: int | None) -> str | None:
+    parsed = _timestamp_ms_to_datetime(value)
+    return parsed.isoformat().replace("+00:00", "Z") if parsed is not None else None
+
+
+def _timestamp_ms_to_datetime(value: int | None) -> datetime | None:
+    if value is None:
+        return None
+    try:
+        parsed = datetime.fromtimestamp(value / 1000, tz=UTC)
+    except (OverflowError, OSError, ValueError):
+        return None
+    return parsed
+
+
+def _normalize_evidence_text(value: str) -> str:
+    return " ".join(unicodedata.normalize("NFKC", value).casefold().split())
 
 
 def _add_response(request: AddRequest) -> AddResponse:

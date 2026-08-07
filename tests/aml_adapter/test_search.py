@@ -7,8 +7,9 @@ from typing import cast
 import pytest
 from hindsight_client import Hindsight
 
+from aml_adapter.raw_retrieval import RawMessageHit
 from aml_adapter.schemas import MemoryEvidence, SearchRequest, SearchResponse
-from aml_adapter.service import HindsightGateway, MemoryDependencyError, user_to_bank_id
+from aml_adapter.service import HindsightGateway, MemoryDependencyError, _merge_search_results, user_to_bank_id
 from tests.aml_adapter.support import app_client, build_harness
 
 
@@ -91,7 +92,13 @@ class StubHindsight:
         self.query = query
         self.budget = budget
         scores = SimpleNamespace(final=0.91)
-        result = SimpleNamespace(id="memory-1", text="东京", scores=scores, mentioned_at="2026-01-15T09:00:00Z")
+        result = SimpleNamespace(
+            id="memory-1",
+            text="东京",
+            scores=scores,
+            mentioned_at="2026-01-15T09:00:00Z",
+            document_id="document-1",
+        )
         return SimpleNamespace(results=[result])
 
 
@@ -105,4 +112,89 @@ async def test_hindsight_gateway_recall_uses_mid_budget_and_final_score() -> Non
     assert stub.bank_id == "bank-1"
     assert stub.query == "住在哪里？"
     assert stub.budget == "mid"
-    assert evidence == [MemoryEvidence(id="memory-1", text="东京", score=0.91, mentioned_at="2026-01-15T09:00:00Z")]
+    assert evidence == [
+        MemoryEvidence(
+            id="memory-1",
+            text="东京",
+            score=0.91,
+            mentioned_at="2026-01-15T09:00:00Z",
+            document_id="document-1",
+        )
+    ]
+
+
+def test_hybrid_fusion_preserves_fact_head_and_keeps_weak_raw_near_the_tail() -> None:
+    evidence = [MemoryEvidence(id=f"fact-{index}", text=f"Fact {index}", score=1 - index / 10) for index in range(1, 6)]
+    raw_hits = [
+        RawMessageHit(
+            document_id="strong",
+            content="Strong lexical evidence",
+            session_id="session-1",
+            role="user",
+            timestamp_ms=None,
+            lexical_score=3.0,
+        ),
+        RawMessageHit(
+            document_id="weak",
+            content="Speaker-only evidence",
+            session_id="session-1",
+            role="Caroline",
+            timestamp_ms=None,
+            lexical_score=1e-6,
+        ),
+    ]
+
+    results = _merge_search_results("What happened?", evidence, raw_hits, 7)
+
+    assert [item.id for item in results] == [
+        "fact-1",
+        "fact-2",
+        "fact-3",
+        "fact-4",
+        "raw:strong",
+        "fact-5",
+        "raw:weak",
+    ]
+
+
+def test_hybrid_fusion_caps_primary_raw_results_and_preserves_deep_facts() -> None:
+    evidence = [
+        MemoryEvidence(id=f"fact-{index}", text=f"Fact {index}", score=1 - index / 1000) for index in range(1, 101)
+    ]
+    raw_hits = [
+        RawMessageHit(
+            document_id=f"raw-{index}",
+            content=f"Raw evidence {index}",
+            session_id="session-1",
+            role="user",
+            timestamp_ms=None,
+            lexical_score=3.0,
+        )
+        for index in range(1, 11)
+    ]
+
+    results = _merge_search_results("What happened?", evidence, raw_hits, 100)
+
+    assert sum(item.id.startswith("raw:") for item in results) == 4
+    assert "fact-96" in [item.id for item in results]
+    assert "fact-97" not in [item.id for item in results]
+
+
+def test_hybrid_fusion_backfills_deferred_raw_results_when_facts_are_sparse() -> None:
+    evidence = [MemoryEvidence(id="fact-1", text="Only fact", score=1.0)]
+    raw_hits = [
+        RawMessageHit(
+            document_id=f"raw-{index}",
+            content=f"Raw evidence {index}",
+            session_id="session-1",
+            role="user",
+            timestamp_ms=None,
+            lexical_score=3.0,
+        )
+        for index in range(1, 10)
+    ]
+
+    results = _merge_search_results("What happened?", evidence, raw_hits, 8)
+
+    assert len(results) == 8
+    assert sum(item.id.startswith("raw:") for item in results) == 7

@@ -98,3 +98,4 @@ class MemoryEvidence(BaseModel):
     text: str
     score: float | None = None
     mentioned_at: str | None = None
+    document_id: str | None = None
