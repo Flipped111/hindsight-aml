@@ -12,7 +12,7 @@ AML GET  /health -> AML adapter + Hindsight dependency health
 ## Fixed baseline
 
 - Submission repository: [Flipped111/hindsight-aml](https://github.com/Flipped111/hindsight-aml)
-- Submission tag: `aml-v0.2.0`
+- Submission tag: `aml-v0.2.1`
 - Upstream project: [vectorize-io/hindsight](https://github.com/vectorize-io/hindsight)
 - Hindsight version: `0.8.6`
 - Upstream baseline commit: `436bc7c156f1c94714ea1f757bfc930ab89f883b`
@@ -133,6 +133,11 @@ curl --fail http://localhost:8000/health
 
 The endpoint returns 200 only when both the SQLite idempotency store and Hindsight (including its database) are healthy;
 otherwise it returns 503.
+
+Business failures use standard non-2xx statuses and the JSON shape `{"detail":{"reason":"..."}}`. Invalid request
+fields use FastAPI's structured HTTP 422 validation response. Add conflicts return 409, dependency failures return 502,
+and an identical request that waits past its idempotency deadline returns 503; these responses never claim a successful
+write.
 
 ## Persistence
 

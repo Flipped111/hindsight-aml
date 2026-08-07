@@ -5,7 +5,8 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Response, status
+from fastapi import FastAPI, Request, Response, status
+from fastapi.responses import JSONResponse
 from hindsight_client import Hindsight
 from pydantic import BaseModel, Field, model_validator
 
@@ -18,6 +19,21 @@ from aml_adapter.service import (
     MemoryService,
 )
 from aml_adapter.storage import IdempotencyStore, RequestConflictError
+
+
+class BusinessError(Exception):
+    def __init__(self, status_code: int, reason: str) -> None:
+        super().__init__(reason)
+        self.status_code = status_code
+        self.reason = reason
+
+
+class ErrorDetail(BaseModel):
+    reason: str
+
+
+class ErrorResponse(BaseModel):
+    detail: ErrorDetail
 
 
 class Settings(BaseModel):
@@ -69,25 +85,30 @@ def create_app(service: MemoryService | None = None) -> FastAPI:
         finally:
             await memory_service.close()
 
-    app = FastAPI(title="Hindsight AML Adapter", version="0.1.2", lifespan=lifespan)
+    app = FastAPI(title="Hindsight AML Adapter", version="0.2.1", lifespan=lifespan)
+
+    @app.exception_handler(BusinessError)
+    async def business_error_handler(_: Request, error: BusinessError) -> JSONResponse:
+        payload = ErrorResponse(detail=ErrorDetail(reason=error.reason))
+        return JSONResponse(status_code=error.status_code, content=payload.model_dump(mode="json"))
 
     @app.post("/add", response_model=AddResponse)
     async def add(request: AddRequest) -> AddResponse:
         try:
             return await memory_service.add(request)
         except RequestConflictError as exc:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+            raise BusinessError(status.HTTP_409_CONFLICT, str(exc)) from exc
         except IdempotencyWaitTimeoutError as exc:
-            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+            raise BusinessError(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
         except MemoryDependencyError as exc:
-            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+            raise BusinessError(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
 
     @app.post("/search", response_model=SearchResponse, response_model_exclude_none=True)
     async def search(request: SearchRequest) -> SearchResponse:
         try:
             return await memory_service.search(request)
         except MemoryDependencyError as exc:
-            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+            raise BusinessError(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
 
     @app.get("/health", response_model=HealthResponse)
     async def health(response: Response) -> HealthResponse:

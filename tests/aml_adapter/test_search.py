@@ -77,6 +77,7 @@ async def test_search_dependency_failure_returns_non_2xx(tmp_path: Path) -> None
         response = await client.post("/search", json=search_request().model_dump(mode="json"))
 
     assert response.status_code == 502
+    assert response.json() == {"detail": {"reason": "recall unavailable"}}
 
 
 class StubHindsight:

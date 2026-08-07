@@ -88,6 +88,25 @@ async def test_add_accepts_message_without_optional_timestamp(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
+async def test_add_validation_error_uses_structured_422_detail(tmp_path: Path) -> None:
+    harness = build_harness(tmp_path / "idempotency.sqlite3")
+    payload = {
+        "request_id": "invalid-request",
+        "messages": [{"role": "user", "content": "   "}],
+        "user_id": "user-1",
+        "session_id": "session-1",
+    }
+
+    async with app_client(harness.service) as client:
+        response = await client.post("/add", json=payload)
+
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert isinstance(detail, list)
+    assert detail[0]["type"] == "value_error"
+
+
+@pytest.mark.asyncio
 async def test_add_failure_is_not_completed_and_can_be_retried(tmp_path: Path) -> None:
     harness = build_harness(tmp_path / "idempotency.sqlite3")
     harness.gateway.fail_next_retain(MemoryDependencyError("retain unavailable"))
@@ -98,6 +117,7 @@ async def test_add_failure_is_not_completed_and_can_be_retried(tmp_path: Path) -
         retried = await client.post("/add", json=request.model_dump(mode="json"))
 
     assert failed.status_code == 502
+    assert failed.json() == {"detail": {"reason": "retain unavailable"}}
     assert retried.status_code == 200
     assert len(harness.gateway.retain_calls) == 2
     assert len(harness.gateway.memories_for(user_to_bank_id(request.user_id))) == 1

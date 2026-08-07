@@ -10,7 +10,7 @@ contract.
 ## Release
 
 - Repository: [Flipped111/hindsight-aml](https://github.com/Flipped111/hindsight-aml)
-- Submission tag: `aml-v0.2.0`
+- Submission tag: `aml-v0.2.1`
 - Hindsight version: `0.8.6`
 - Upstream baseline: `436bc7c156f1c94714ea1f757bfc930ab89f883b`
 

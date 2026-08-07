@@ -48,6 +48,7 @@ async def test_reused_request_id_with_different_identity_conflicts(
 
     assert first.status_code == 200
     assert conflict.status_code == 409
+    assert conflict.json() == {"detail": {"reason": "request_id 'request-1' was already used"}}
     assert len(harness.gateway.retain_calls) == 1
 
 
@@ -92,6 +93,7 @@ async def test_waiting_duplicate_returns_503_after_deadline(tmp_path: Path) -> N
 
     assert first.status_code == 200
     assert waiting.status_code == 503
+    assert waiting.json() == {"detail": {"reason": "request_id 'request-1' is still processing"}}
     assert len(harness.gateway.retain_calls) == 1
 
 

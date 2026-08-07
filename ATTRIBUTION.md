@@ -14,7 +14,7 @@ Vectorize AI, Inc. and its contributors.
 ## Submission release
 
 - Repository: [Flipped111/hindsight-aml](https://github.com/Flipped111/hindsight-aml)
-- Release tag: `aml-v0.2.0`
+- Release tag: `aml-v0.2.1`
 
 The upstream Hindsight implementation, generated clients, documentation, and existing notices remain under their
 original terms. No claim is made that the AML adapter is part of or endorsed by the upstream project.
