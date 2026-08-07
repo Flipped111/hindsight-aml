@@ -14,7 +14,7 @@ Vectorize AI, Inc. and its contributors.
 ## Submission release
 
 - Repository: [Flipped111/hindsight-aml](https://github.com/Flipped111/hindsight-aml)
-- Release tag: `aml-v0.1.2`
+- Release tag: `aml-v0.2.0`
 
 The upstream Hindsight implementation, generated clients, documentation, and existing notices remain under their
 original terms. No claim is made that the AML adapter is part of or endorsed by the upstream project.
@@ -33,6 +33,8 @@ upstream Hindsight retain, recall, or reflect APIs. The added work includes:
   stable retry behavior, and owner-token lease protection.
 - Hindsight recall-only evidence conversion using `scores.final`, stable result IDs, reliable event timestamps, sorting,
   filtering, and `top_k` truncation. The adapter does not call `reflect` or generate answers.
+- A deterministic `tools/aml_eval.py` Add/Search runner that records status, latency, evidence snapshots, Hit@K, and
+  MRR from caller-supplied expected content terms without generating answers or judging with an LLM.
 - A fixed-source Docker Compose deployment with separate persistent volumes for Hindsight pg0 data and AML idempotency
   state.
 - Fake/mock contract, isolation, concurrency, failure, and restart-persistence tests under `tests/aml_adapter/`.

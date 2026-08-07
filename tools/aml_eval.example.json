@@ -1,0 +1,31 @@
+{
+  "cases": [
+    {
+      "case_id": "smoke-user-tokyo",
+      "adds": [
+        {
+          "request_id": "aml-eval:smoke-user-tokyo:add-0",
+          "messages": [
+            {
+              "role": "user",
+              "timestamp": 1704067200000,
+              "content": "I moved to Tokyo."
+            }
+          ],
+          "user_id": "aml-eval:smoke-user-tokyo",
+          "session_id": "aml-eval:smoke-user-tokyo:session-0"
+        }
+      ],
+      "searches": [
+        {
+          "query_id": "where-do-i-live",
+          "query": "Where do I live now?",
+          "options": [],
+          "user_id": "aml-eval:smoke-user-tokyo",
+          "top_k": 5,
+          "expected_terms": ["Tokyo"]
+        }
+      ]
+    }
+  ]
+}

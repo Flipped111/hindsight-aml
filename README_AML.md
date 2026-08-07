@@ -12,7 +12,7 @@ AML GET  /health -> AML adapter + Hindsight dependency health
 ## Fixed baseline
 
 - Submission repository: [Flipped111/hindsight-aml](https://github.com/Flipped111/hindsight-aml)
-- Submission tag: `aml-v0.1.2`
+- Submission tag: `aml-v0.2.0`
 - Upstream project: [vectorize-io/hindsight](https://github.com/vectorize-io/hindsight)
 - Hindsight version: `0.8.6`
 - Upstream baseline commit: `436bc7c156f1c94714ea1f757bfc930ab89f883b`
@@ -157,6 +157,25 @@ PYTHONPATH=. .venv/bin/pytest tests/aml_adapter -n 0
 ```
 
 Real Hindsight and Docker restart smoke tests still require an environment with the model credential and Docker daemon.
+
+## AML Evaluation Runner
+
+The repository includes a deterministic Add/Search runner for comparing adapter versions without generating answers or
+using a model judge. It records per-request status and latency, preserves returned evidence, and calculates Hit@1,
+Hit@5, Hit@10, Hit@100, MRR, and latency percentiles from expected content terms.
+
+The manifest format is shown in [tools/aml_eval.example.json](./tools/aml_eval.example.json). Run it against a started
+AML API with the repository development environment:
+
+```bash
+PYTHONPATH=. .venv/bin/python -m tools.aml_eval \
+  --manifest tools/aml_eval.example.json \
+  --base-url http://127.0.0.1:8000 \
+  --output aml-eval-report.json
+```
+
+The runner exits non-zero when Add or Search requests fail. The report is local measurement output and must not be
+submitted as benchmark ground truth.
 
 ## Known limitations and planned work
 
