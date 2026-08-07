@@ -12,7 +12,7 @@ AML GET  /health -> AML adapter + Hindsight dependency health
 ## Fixed baseline
 
 - Submission repository: [Flipped111/hindsight-aml](https://github.com/Flipped111/hindsight-aml)
-- Submission tag: `aml-v0.1.1`
+- Submission tag: `aml-v0.1.2`
 - Upstream project: [vectorize-io/hindsight](https://github.com/vectorize-io/hindsight)
 - Hindsight version: `0.8.6`
 - Upstream baseline commit: `436bc7c156f1c94714ea1f757bfc930ab89f883b`
@@ -92,6 +92,9 @@ The adapter maps `user_id` to a dedicated Hindsight Bank using SHA-256. Every me
 derived from `request_id` and its index. The retained source preserves the speaker, session, UTC event time, original
 message, and required metadata. Add uses `aretain_batch(..., retain_async=False)` and returns 200 only after Hindsight
 confirms the whole synchronous retain.
+
+The AML `timestamp` field is optional. When it is omitted, the adapter records `Event time: Unknown` and sends
+Hindsight's explicit `unset` timestamp instead of inventing an event time.
 
 Completed request identities are stored in SQLite before retain begins. Identical retries return the original success,
 conflicting reuse returns HTTP 409, concurrent identical requests wait for the first owner, and abandoned claims can be

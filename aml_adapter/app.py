@@ -69,7 +69,7 @@ def create_app(service: MemoryService | None = None) -> FastAPI:
         finally:
             await memory_service.close()
 
-    app = FastAPI(title="Hindsight AML Adapter", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="Hindsight AML Adapter", version="0.1.2", lifespan=lifespan)
 
     @app.post("/add", response_model=AddResponse)
     async def add(request: AddRequest) -> AddResponse:

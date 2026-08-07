@@ -68,6 +68,26 @@ async def test_add_assigns_a_stable_document_id_to_each_message(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
+async def test_add_accepts_message_without_optional_timestamp(tmp_path: Path) -> None:
+    harness = build_harness(tmp_path / "idempotency.sqlite3")
+    payload = {
+        "request_id": "request-without-timestamp",
+        "messages": [{"role": "user", "content": "I live in Kyoto."}],
+        "user_id": "user-1",
+        "session_id": "session-1",
+    }
+
+    async with app_client(harness.service) as client:
+        response = await client.post("/add", json=payload)
+
+    assert response.status_code == 200
+    item = harness.gateway.retain_calls[0].items[0]
+    assert item.timestamp == "unset"
+    assert "Event time: Unknown" in item.content
+    assert item.metadata["original_timestamp"] == "unset"
+
+
+@pytest.mark.asyncio
 async def test_add_failure_is_not_completed_and_can_be_retried(tmp_path: Path) -> None:
     harness = build_harness(tmp_path / "idempotency.sqlite3")
     harness.gateway.fail_next_retain(MemoryDependencyError("retain unavailable"))

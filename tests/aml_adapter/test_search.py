@@ -57,6 +57,18 @@ async def test_search_always_returns_data_for_no_results(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
+async def test_search_accepts_request_without_optional_options(tmp_path: Path) -> None:
+    harness = build_harness(tmp_path / "idempotency.sqlite3")
+    payload = {"query": "Where do I live?", "user_id": "user-1", "top_k": 100}
+
+    async with app_client(harness.service) as client:
+        response = await client.post("/search", json=payload)
+
+    assert response.status_code == 200
+    assert response.json() == {"data": []}
+
+
+@pytest.mark.asyncio
 async def test_search_dependency_failure_returns_non_2xx(tmp_path: Path) -> None:
     harness = build_harness(tmp_path / "idempotency.sqlite3")
     harness.gateway.fail_next_recall(MemoryDependencyError("recall unavailable"))

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -11,7 +12,7 @@ class AmlModel(BaseModel):
 
 class Message(AmlModel):
     role: str
-    timestamp: int = Field(ge=0)
+    timestamp: int | None = None
     content: str
 
     @field_validator("role", "content")
@@ -23,7 +24,9 @@ class Message(AmlModel):
 
     @field_validator("timestamp")
     @classmethod
-    def require_supported_timestamp(cls, value: int) -> int:
+    def require_supported_timestamp(cls, value: int | None) -> int | None:
+        if value is None:
+            return None
         try:
             datetime.fromtimestamp(value / 1000, tz=UTC)
         except (OverflowError, OSError, ValueError) as exc:
@@ -54,7 +57,7 @@ class AddResponse(AmlModel):
 
 class SearchRequest(AmlModel):
     query: str
-    options: list[str]
+    options: list[str] = Field(default_factory=list)
     user_id: str
     top_k: int = Field(ge=1, le=100)
 
@@ -85,7 +88,7 @@ class HealthResponse(AmlModel):
 
 class RetainItem(BaseModel):
     content: str
-    timestamp: datetime
+    timestamp: datetime | Literal["unset"]
     metadata: dict[str, str]
     document_id: str
 

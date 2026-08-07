@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from httpx import ASGITransport, AsyncClient
@@ -76,13 +77,19 @@ class FakeGateway:
         if bank_id in self._recall_results:
             return list(self._recall_results[bank_id])
 
-        memories = sorted(self._memories.get(bank_id, {}).values(), key=lambda item: item.timestamp, reverse=True)
+        retained_items = list(self._memories.get(bank_id, {}).values())
+        timestamped = sorted(
+            (item for item in retained_items if isinstance(item.timestamp, datetime)),
+            key=lambda item: item.timestamp,
+            reverse=True,
+        )
+        memories = timestamped + [item for item in retained_items if not isinstance(item.timestamp, datetime)]
         return [
             MemoryEvidence(
                 id=item.document_id,
                 text=item.content,
                 score=1.0 - (index / 1000),
-                mentioned_at=item.timestamp.isoformat(),
+                mentioned_at=item.timestamp.isoformat() if isinstance(item.timestamp, datetime) else None,
             )
             for index, item in enumerate(memories)
         ]

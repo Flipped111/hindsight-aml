@@ -6,7 +6,7 @@ import json
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from hindsight_client import Hindsight
 from pydantic import BaseModel
@@ -183,8 +183,15 @@ def _payload_hash(request: AddRequest) -> str:
 def _retain_items(request: AddRequest) -> list[RetainItem]:
     items: list[RetainItem] = []
     for index, message in enumerate(request.messages):
-        event_time = datetime.fromtimestamp(message.timestamp / 1000, tz=UTC)
-        event_time_text = event_time.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        retain_timestamp: datetime | Literal["unset"]
+        if message.timestamp is None:
+            retain_timestamp = "unset"
+            event_time_text = "Unknown"
+            original_timestamp = "unset"
+        else:
+            retain_timestamp = datetime.fromtimestamp(message.timestamp / 1000, tz=UTC)
+            event_time_text = retain_timestamp.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+            original_timestamp = str(message.timestamp)
         document_id = hashlib.sha256(f"{request.request_id}:{index}".encode("utf-8")).hexdigest()
         content = (
             f"Speaker: {message.role}\n"
@@ -195,13 +202,13 @@ def _retain_items(request: AddRequest) -> list[RetainItem]:
         items.append(
             RetainItem(
                 content=content,
-                timestamp=event_time,
+                timestamp=retain_timestamp,
                 document_id=document_id,
                 metadata={
                     "request_id": request.request_id,
                     "session_id": request.session_id,
                     "role": message.role,
-                    "original_timestamp": str(message.timestamp),
+                    "original_timestamp": original_timestamp,
                 },
             )
         )
