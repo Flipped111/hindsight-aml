@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "repository": "vectorize-io/hindsight",
+  "repository": "Flipped111/hindsight-aml",
   "backfilledAt": "2026-08-03T10:36:26.721Z",
   "backfill": [
     {
@@ -996,6 +996,10 @@
     {
       "date": "2026-08-06",
       "stars": 19145
+    },
+    {
+      "date": "2026-08-08",
+      "stars": 0
     }
   ]
 }
